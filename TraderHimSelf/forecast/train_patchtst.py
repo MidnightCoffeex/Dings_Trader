@@ -27,17 +27,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("Forecast-PatchTST")
 
-# Constants
+# Constants (Model Architecture & Data)
 LOOKBACK = 512
 FORECAST_HORIZON = 192  # Max horizon (48h * 4 steps/h)
 INPUT_CHANNELS = 28
 QUANTILES = [0.1, 0.5, 0.9]
 HORIZON_STEPS = [4, 16, 48, 96, 192]  # 1h, 4h, 12h, 24h, 48h
 HORIZON_WEIGHTS = {4: 1.0, 16: 1.0, 48: 0.8, 96: 0.6, 192: 0.4}
-BATCH_SIZE = 32 # Can be adjusted
-EPOCHS = 20
-LR = 1e-4
-NUM_WORKERS = 0
+
+# Training Defaults (can be overridden by args)
+DEFAULT_EPOCHS = 20
+DEFAULT_LR = 1e-4
 
 # Paths
 DATA_DIR = os.path.join(BASE_DIR, "data_processed")
@@ -65,35 +65,25 @@ class ForecastDataset(Dataset):
         self.mode = mode
         
         # Ensure data is sorted
-        # Assuming df has index or time column, but here we assume passed df is correct order
         self.data = df
         
-        # Identify feature columns (assuming first 28 columns match core features or passed explicitly)
-        # For simplicity, we assume the first 28 columns are the features, or we define them.
-        # Based on roadmap: "28 Core Features (normalisiert)". 
-        # We assume the dataframe passed here already has the scaler applied or we handle normalization outside.
-        # Ideally, we select the specific columns.
         # Feature column selection
         if feature_cols is not None:
             self.feature_cols = list(feature_cols)
         else:
-            # Fallback: assume the first 28 columns are features (and 'close' is separate/last)
+            # Fallback: assume the first 28 columns are features
             self.feature_cols = list(df.columns[:INPUT_CHANNELS])
         
         # We need 'close' for target calculation if not in features (it usually isn't raw close)
         if 'close' in df.columns:
             self.close_prices = df['close'].values
         else:
-            # Fallback for inference if close not provided separately but needed? 
-            # Actually targets are derived from close. For inference we don't need targets.
             self.close_prices = np.zeros(len(df))
 
         # Convert features to float32 numpy
         self.features = df[self.feature_cols].values.astype(np.float32)
         
         # Calculate valid indices (t = index of the *last* row included in the lookback window)
-        # We want x to include rows [t-lookback+1 .. t] (length=lookback).
-        # For training targets we need future closes up to t+forecast_horizon.
         t_min = self.lookback - 1
         if self.mode in ['train', 'val', 'test']:
             t_max = len(df) - self.forecast_horizon - 1
@@ -115,7 +105,6 @@ class ForecastDataset(Dataset):
             return torch.tensor(x), torch.zeros(self.forecast_horizon)  # Dummy target
 
         # Target: log returns for the next forecast_horizon steps relative to close[t]
-        # Roadmap: y_{t,s} = log(close_{t+s} / close_t), with s in 1..H
         current_close = self.close_prices[t]
         future_closes = self.close_prices[t + 1 : t + 1 + self.forecast_horizon]
 
@@ -137,12 +126,8 @@ class PatchEmbedding(nn.Module):
         # x: (B, C, L)
         B, C, L = x.shape
         # Patching
-        # Output: (B, C, N_patches, patch_len)
-        # Using unfold
         x = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
         # x: (B, C, N_patches, patch_len)
-        
-        # Project to d_model
         x = self.project(x) 
         # x: (B, C, N_patches, d_model)
         return x
@@ -155,30 +140,18 @@ class PatchTST(nn.Module):
         self.lookback = lookback
         self.forecast_len = forecast_len
         
-        # Calculate number of patches
         self.n_patches = (lookback - patch_len) // stride + 1
         
         self.patch_embed = PatchEmbedding(patch_len, stride, d_model)
-        
-        # Positional Encoding (Learnable)
         self.pos_embed = nn.Parameter(torch.randn(1, 1, self.n_patches, d_model))
         
-        # Transformer Encoder (Channel Independent -> Batch dimension includes channels)
         encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_heads, 
                                                    dim_feedforward=d_model*4, dropout=dropout,
                                                    batch_first=True, norm_first=True)
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         
-        # Head: Multivariate to Univariate (3 quantiles per step)
-        # We flatten all channels and patches: 28 * N_patches * d_model -> very large.
-        # Strategy: Global pooling or Flatten? 
-        # Roadmap implies "Architectur: PatchTST". Original PatchTST uses Linear Head per channel.
-        # But we need to predict Close Return based on ALL 28 features.
-        # So we must mix channels at the end.
-        
         self.flatten_dim = input_dim * self.n_patches * d_model
         
-        # Simple MLP Head
         self.head = nn.Sequential(
             nn.Flatten(),
             nn.Linear(self.flatten_dim, 512),
@@ -191,10 +164,8 @@ class PatchTST(nn.Module):
         # x: (B, L, C) -> transpose to (B, C, L)
         x = x.transpose(1, 2)
         
-        # Embedding: (B, C, N, D)
+        # Embedding
         x = self.patch_embed(x)
-        
-        # Add pos embed
         x = x + self.pos_embed
         
         B, C, N, D = x.shape
@@ -204,33 +175,25 @@ class PatchTST(nn.Module):
         # Encoder
         x = self.encoder(x)
         
-        # Reshape back: (B, C, N, D)
+        # Reshape back
         x = x.reshape(B, C, N, D)
         
         # Head
-        out = self.head(x) # (B, H*3)
+        out = self.head(x)
         
-        # Reshape to (B, H, 3)
+        # Reshape
         out = out.reshape(B, self.forecast_len, 3)
         return out
 
 # --- 3. Loss: Quantile / Pinball ---
 
 def quantile_loss(preds, target, quantiles=QUANTILES, weights=None, horizon_indices=None):
-    """
-    preds: (B, H, 3) - predicted quantiles
-    target: (B, H) - actual returns
-    weights: list of weights for specific horizons (optional)
-    horizon_indices: list of indices to apply loss on (optional)
-    """
     loss = 0
     
     # If we focus on specific horizons
     if horizon_indices is not None:
-        # Select steps
         preds = preds[:, horizon_indices, :]
         target = target[:, horizon_indices]
-        # weights should match horizon_indices length
         if weights is not None:
             w = torch.tensor(weights, device=preds.device).view(1, -1)
         else:
@@ -258,35 +221,24 @@ def compute_forecast_features(forecast_seq):
     q90 = forecast_seq[:, 2]
     
     # 1. Horizon Block (15 features)
-    # Indices: 4, 16, 48, 96, 192 (0-indexed: 3, 15, 47, 95, 191)
-    # Ensure we don't go out of bounds if forecast len < 192 (should not happen)
     indices = [3, 15, 47, 95, 191]
     horizon_feats = []
     for idx in indices:
         horizon_feats.extend([q10[idx], q50[idx], q90[idx]])
         
     # 2. Path Block (12 features)
-    # 12 points over 48h (every 4h) from q50
-    # 4h = 16 steps. Indices: 15, 31, 47, ..., 191
-    path_indices = np.arange(15, 192, 16) # 16, 32... 192 (length 12)
+    path_indices = np.arange(15, 192, 16)
     path_feats = q50[path_indices].tolist()
     
     # 3. Curve Stats (8 features) on q50
-    # Prepend 0 to represent the start point (t=0, return=0) for accurate stats
     curve = np.concatenate(([0], q50))
     
-    # min_ret, max_ret
     min_ret = np.min(curve)
     max_ret = np.max(curve)
     
-    # time_to_min, time_to_max (normalized 0..1)
-    # indices shifted by 1 due to prepended 0, but we divide by 192 total steps
     time_to_min = np.argmin(curve) / 192.0
     time_to_max = np.argmax(curve) / 192.0
     
-    # max_drawdown, max_runup
-    # Drawdown: max drop from a peak
-    # Runup: max rise from a valley
     running_max = np.maximum.accumulate(curve)
     dd = running_max - curve
     max_drawdown = np.max(dd)
@@ -295,18 +247,11 @@ def compute_forecast_features(forecast_seq):
     ru = curve - running_min
     max_runup = np.max(ru)
     
-    # Slopes
-    # slope_0_12h (0 to step 48) -> Index 48 in curve (which is step 48)
-    # slope_12_48h (step 48 to 192)
-    
-    # Index 48 is step 48 (12h)
-    # Index 192 is step 192 (48h)
     slope_1 = curve[48] / 48.0
     slope_2 = (curve[192] - curve[48]) / (192.0 - 48.0)
     
     stats_feats = [min_ret, max_ret, time_to_min, time_to_max, max_drawdown, max_runup, slope_1, slope_2]
     
-    # Concatenate
     all_feats = np.array(horizon_feats + path_feats + stats_feats, dtype=np.float32)
     return all_feats
 
@@ -341,7 +286,6 @@ def load_data() -> pd.DataFrame:
     if "close" not in raw_15m.columns:
         raise ValueError("aligned_15m.parquet missing required column: close")
 
-    # Align close to feature index (scaled core features are the base)
     close = raw_15m["close"].reindex(feats.index)
     if close.isna().any():
         raise ValueError("Missing close prices after aligning aligned_15m to features index.")
@@ -350,15 +294,62 @@ def load_data() -> pd.DataFrame:
     df["close"] = close.values
     return df
 
+def get_config(args):
+    """Resolve configuration based on profile and explicit args."""
+    config = {
+        'batch_size': 32,
+        'num_workers': 0,
+        'pin_memory': False,
+        'prefetch_factor': None,
+        'persistent_workers': False,
+        'amp': False,
+        'compile': False
+    }
+    
+    if args.profile == 'high-util':
+        config.update({
+            'batch_size': 256,
+            'num_workers': 4,
+            'pin_memory': True,
+            'prefetch_factor': 2,
+            'persistent_workers': True,
+            'amp': True,
+            'compile': True
+        })
+    
+    # Override with explicit args if provided
+    if args.batch_size is not None: config['batch_size'] = args.batch_size
+    if args.num_workers is not None: config['num_workers'] = args.num_workers
+    if args.pin_memory is not None: config['pin_memory'] = args.pin_memory
+    if args.prefetch_factor is not None: config['prefetch_factor'] = args.prefetch_factor
+    if args.persistent_workers is not None: config['persistent_workers'] = args.persistent_workers
+    if args.amp is not None: config['amp'] = args.amp
+    if args.compile is not None: config['compile'] = args.compile
+
+    # Safety checks
+    if config['num_workers'] == 0:
+        config['prefetch_factor'] = None
+        config['persistent_workers'] = False
+        
+    return config
+
 def train_model(args):
+    cfg = get_config(args)
+    logger.info(f"Configuration: {cfg}")
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
     
+    if device.type == 'cuda' and cfg['amp']:
+        logger.info("AMP enabled.")
+        
+    if cfg['compile'] and not hasattr(torch, 'compile'):
+        logger.warning("torch.compile not supported in this torch version. Disabling compile.")
+        cfg['compile'] = False
+
     df = load_data()
-    
     feature_cols = FEATURE_COLUMNS
     
-    # Split
     train_size = int(len(df) * 0.8)
     train_df = df.iloc[:train_size]
     val_df = df.iloc[train_size:]
@@ -366,31 +357,53 @@ def train_model(args):
     train_ds = ForecastDataset(train_df, mode='train', feature_cols=feature_cols)
     val_ds = ForecastDataset(val_df, mode='val', feature_cols=feature_cols)
     
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
+    loader_kwargs = {
+        'batch_size': cfg['batch_size'],
+        'num_workers': cfg['num_workers'],
+        'pin_memory': cfg['pin_memory'],
+    }
+    if cfg['num_workers'] > 0:
+        loader_kwargs['prefetch_factor'] = cfg['prefetch_factor']
+        loader_kwargs['persistent_workers'] = cfg['persistent_workers']
+    
+    train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
     
     model = PatchTST().to(device)
-    optimizer = AdamW(model.parameters(), lr=LR)
-    scheduler = OneCycleLR(optimizer, max_lr=LR, steps_per_epoch=len(train_loader), epochs=EPOCHS)
     
-    # Loss config
-    horizon_indices = [3, 15, 47, 95, 191] # corresponding to 4, 16, 48, 96, 192 steps (0-indexed)
+    if cfg['compile']:
+        logger.info("Compiling model...")
+        try:
+            model = torch.compile(model)
+        except Exception as e:
+            logger.error(f"Compilation failed: {e}. Continuing without compilation.")
+
+    optimizer = AdamW(model.parameters(), lr=DEFAULT_LR)
+    scheduler = OneCycleLR(optimizer, max_lr=DEFAULT_LR, steps_per_epoch=len(train_loader), epochs=DEFAULT_EPOCHS)
+    scaler = torch.cuda.amp.GradScaler(enabled=cfg['amp'])
+    
+    horizon_indices = [3, 15, 47, 95, 191]
     weights = [HORIZON_WEIGHTS[h] for h in HORIZON_STEPS]
     
     best_val_loss = float('inf')
     
     logger.info("Starting training...")
-    for epoch in range(EPOCHS):
+    for epoch in range(DEFAULT_EPOCHS):
         model.train()
         train_loss = 0
         for x, y in train_loader:
-            x, y = x.to(device), y.to(device)
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             optimizer.zero_grad()
-            pred = model(x) # (B, 192, 3)
-            loss = quantile_loss(pred, y, weights=weights, horizon_indices=horizon_indices)
-            loss.backward()
-            optimizer.step()
+            
+            with torch.cuda.amp.autocast(enabled=cfg['amp']):
+                pred = model(x)
+                loss = quantile_loss(pred, y, weights=weights, horizon_indices=horizon_indices)
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
+            
             train_loss += loss.item()
             
         train_loss /= len(train_loader)
@@ -399,14 +412,15 @@ def train_model(args):
         val_loss = 0
         with torch.no_grad():
             for x, y in val_loader:
-                x, y = x.to(device), y.to(device)
-                pred = model(x)
-                loss = quantile_loss(pred, y, weights=weights, horizon_indices=horizon_indices)
+                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+                with torch.cuda.amp.autocast(enabled=cfg['amp']):
+                    pred = model(x)
+                    loss = quantile_loss(pred, y, weights=weights, horizon_indices=horizon_indices)
                 val_loss += loss.item()
         
         val_loss /= len(val_loader)
         
-        logger.info(f"Epoch {epoch+1}/{EPOCHS} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
+        logger.info(f"Epoch {epoch+1}/{DEFAULT_EPOCHS} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
         
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -414,49 +428,60 @@ def train_model(args):
             logger.info("Saved best model.")
 
 def precompute_features(args):
+    cfg = get_config(args)
+    # For inference, we can often use larger batches
+    cfg['batch_size'] = cfg['batch_size'] * 2
+    logger.info(f"Precompute Configuration: {cfg}")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Starting Precompute...")
     
     df = load_data()
     ds = ForecastDataset(df, mode='inference', feature_cols=FEATURE_COLUMNS)
-    loader = DataLoader(ds, batch_size=BATCH_SIZE*2, shuffle=False, num_workers=NUM_WORKERS)
+    
+    loader_kwargs = {
+        'batch_size': cfg['batch_size'],
+        'num_workers': cfg['num_workers'],
+        'pin_memory': cfg['pin_memory'],
+    }
+    if cfg['num_workers'] > 0:
+        loader_kwargs['prefetch_factor'] = cfg['prefetch_factor']
+        loader_kwargs['persistent_workers'] = cfg['persistent_workers']
+
+    loader = DataLoader(ds, shuffle=False, **loader_kwargs)
     
     model = PatchTST().to(device)
     model_path = os.path.join(MODEL_DIR, "forecast_model.pt")
     if not os.path.exists(model_path):
         logger.warning(f"Model not found at {model_path}. Using randomly initialized weights.")
     else:
+        # Load weights before compile
         model.load_state_dict(torch.load(model_path, map_location=device))
+        
+    if cfg['compile']:
+        model = torch.compile(model)
         
     model.eval()
     
     all_features = []
     
-    # Pre-allocate array for efficiency? 
-    # Length will be len(ds). 
-    # We will use a list and concat later, safer.
-    
     with torch.no_grad():
         for x, _ in loader:
-            x = x.to(device)
-            preds = model(x) # (B, 192, 3)
-            preds_np = preds.cpu().numpy()
+            x = x.to(device, non_blocking=True)
+            with torch.cuda.amp.autocast(enabled=cfg['amp']):
+                preds = model(x)
+            preds_np = preds.float().cpu().numpy() # Ensure float32 for CPU
             
-            # Compute features for batch
+            # Compute features for batch (CPU bound)
+            # Parallelizing this part might be needed if it becomes bottleneck
             batch_feats = [compute_forecast_features(p) for p in preds_np]
             all_features.extend(batch_feats)
             
-    # Pad the beginning (lookback period) with NaNs or zeros to match original df length
-    # ForecastDataset only iterates over valid_indices (lookback to end).
-    # So we have results for indices [lookback, len(df)].
-    # The first 'lookback' rows have no forecast.
-    
     if len(all_features) == 0:
         features_array = np.empty((0, 35), dtype=np.float32)
     else:
         features_array = np.array(all_features, dtype=np.float32)
 
-    # Full-length output aligned to input index with NaN padding for initial lookback rows.
     full = np.full((len(df), 35), np.nan, dtype=np.float32)
     valid_positions = np.array(list(ds.valid_indices), dtype=int)
     if len(valid_positions) != len(features_array):
@@ -466,13 +491,35 @@ def precompute_features(args):
     feat_df = pd.DataFrame(full, index=df.index)
     feat_df.columns = [f"forecast_{i}" for i in range(35)]
     
-    # Save
     feat_df.to_parquet(OUTPUT_FEATURES_PATH)
     logger.info(f"Saved forecast features to {OUTPUT_FEATURES_PATH}. Shape: {feat_df.shape}")
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('mode', choices=['train', 'precompute'], help='Mode: train or precompute')
+    
+    # Profile arg
+    parser.add_argument('--profile', choices=['default', 'high-util'], default='default', help='Hardware profile')
+    
+    # Overrides
+    parser.add_argument('--batch-size', type=int, help='Batch size')
+    parser.add_argument('--num-workers', type=int, help='Number of dataloader workers')
+    parser.add_argument('--pin-memory', type=str2bool, help='Pin memory for DataLoader')
+    parser.add_argument('--persistent-workers', type=str2bool, help='Persistent workers')
+    parser.add_argument('--prefetch-factor', type=int, help='Prefetch factor')
+    parser.add_argument('--amp', type=str2bool, help='Use Automatic Mixed Precision')
+    parser.add_argument('--compile', type=str2bool, help='Use torch.compile')
+
     args = parser.parse_args()
     
     if args.mode == 'train':

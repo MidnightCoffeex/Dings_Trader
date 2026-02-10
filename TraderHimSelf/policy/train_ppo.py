@@ -16,7 +16,7 @@ Anforderungen:
 - Reward: Delta Equity - penalties.
 
 Nutzung:
-    python train_ppo.py
+    python train_ppo.py --profile high-util
 """
 
 import os
@@ -28,7 +28,7 @@ import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 # Add project root to path to allow imports
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -49,14 +49,7 @@ CORE_DIM = 28
 FORECAST_DIM = 35
 ACCOUNT_DIM = 9
 
-TRAIN_TIMESTEPS = 1_000_000  # Beispielwert, anpassen nach Bedarf
-LEARNING_RATE = 3e-4
-BATCH_SIZE = 64
-N_STEPS = 2048  # Steps per update
-
 # --- FORECAST FEATURE COLUMNS ---
-# Da die Namen nicht fix definiert waren, generieren wir sie hier generisch oder erwarten sie.
-# Wir nehmen an, sie heißen forecast_0 ... forecast_34
 FORECAST_COLUMNS = [f"forecast_{i}" for i in range(FORECAST_DIM)]
 
 class TrainingPerpEnv(PerpEnv):
@@ -73,7 +66,6 @@ class TrainingPerpEnv(PerpEnv):
             f"Expected {CORE_DIM + FORECAST_DIM} feature columns, got {len(self.feature_cols)}"
             
         # Ensure Observation Space matches
-        # PerpEnv setzt ihn bereits auf 72, aber sicher ist sicher
         self.observation_space = self.observation_space # Box(72,)
 
     def _get_obs(self):
@@ -82,28 +74,16 @@ class TrainingPerpEnv(PerpEnv):
         Aufbau: [Core Features (28) | Forecast Features (35) | Account State (9)]
         """
         # 1. ML Features aus DataFrame holen
-        # Wir greifen direkt auf die Zeile zu. df_15m sollte die Features enthalten.
-        # .iloc ist etwas langsam, aber für Training akzeptabel (Vectorized Env hilft).
-        # Optimierung: self.features_np array nutzen
         if not hasattr(self, 'features_np'):
              self.features_np = self.df_15m[self.feature_cols].values.astype(np.float32)
         
-        # Check Bounds
         idx = self.current_step
         if idx >= len(self.features_np):
-            # Fallback am Ende (sollte durch done handled sein)
             ml_features = np.zeros(CORE_DIM + FORECAST_DIM, dtype=np.float32)
         else:
             ml_features = self.features_np[idx]
             
-        # 2. Account State (nutzt Logik der Parent Class, aber wir müssen den Code duplizieren 
-        # oder die Parent Methode aufrufen, wenn sie nur den Account Part zurückgibt?
-        # PerpEnv._get_obs gibt zeros + account zurück.
-        # Wir können den Account Part berechnen.
-        
-        # Copy-Paste der Account-State Logik aus PerpEnv um sicher zu gehen und sauber zu mergen.
-        # (Alternativ: PerpEnv refactorn, aber ich soll nur dieses File schreiben)
-        
+        # 2. Account State (Logic copied from PerpEnv to ensure self-contained consistency)
         pos_count = len(self.open_positions)
         major_side = 0
         if pos_count > 0:
@@ -123,12 +103,8 @@ class TrainingPerpEnv(PerpEnv):
         if pos_count > 0:
             time_in_trade_max = max(p.time_in_trade_steps_15m for p in self.open_positions)
             
-        # Import TradingConfig constants via instance if possible or hardcode match
-        # PerpEnv nutzt TradingConfig.MAX_HOLD_STEPS = 192
         time_left_min = 192 - time_in_trade_max
-        
-        liq_buffer_min = 1.0 # Placeholder wie in PerpEnv
-        
+        liq_buffer_min = 1.0 
         avail_exp_pct = (self.equity * self.max_exposure_pct - total_margin) / equity
         
         account_vec = np.array([
@@ -195,11 +171,7 @@ def load_data(*, allow_dummy_forecast: bool = False):
             else:
                 raise ValueError(f"Missing forecast columns: {missing_fc}")
         
-    # Merge Features into df_15m
-    # Wir nehmen an, der Index ist aligned (DatetimeIndex)
     print("Merge DataFrames...")
-    
-    # Check consistency
     common_idx = df_15m.index.intersection(df_feat.index).intersection(df_forecast.index)
     if len(common_idx) < 1000:
         print(f"Warnung: Sehr wenig gemeinsame Datenpunkte ({len(common_idx)}). Check Alignment.")
@@ -208,23 +180,17 @@ def load_data(*, allow_dummy_forecast: bool = False):
     df_feat = df_feat.loc[common_idx].copy()
     df_forecast = df_forecast.loc[common_idx].copy()
     
-    # Add columns
     for col in CORE_FEATURE_COLUMNS:
         df_15m[col] = df_feat[col]
         
     for col in FORECAST_COLUMNS:
-        if col not in df_forecast.columns:
-            raise ValueError(f"Missing forecast column after rename: {col}")
         df_15m[col] = df_forecast[col]
             
-    # ATR Alias für Environment
     if 'atr_14' in df_15m.columns:
         df_15m['atr'] = df_15m['atr_14']
     else:
-        # Fallback approximation
         df_15m['atr'] = df_15m['close'] * 0.01 
         
-    # Align 3m data to 15m time span via slot_15m mapping
     if "slot_15m" not in df_3m.columns:
         raise ValueError("aligned_3m.parquet missing required column: slot_15m")
     if "open_time_ms" not in df_15m.columns:
@@ -237,87 +203,101 @@ def load_data(*, allow_dummy_forecast: bool = False):
 
 
 def make_env(df_15m, df_3m):
-    """Factory function für SB3."""
-    # Definiere Feature Liste
-    # Prüfe ob Forecast Features da sind, sonst Nullen füllen oder Error
     feature_cols = CORE_FEATURE_COLUMNS + FORECAST_COLUMNS
-    
-    # Check if cols exist
     missing = [c for c in feature_cols if c not in df_15m.columns]
     if missing:
-        # Wenn wir Dummy Forecasts nutzen, sollten sie da sein.
-        # Falls Core fehlt -> Error
         raise ValueError(f"Missing columns in df_15m: {missing[:5]}...")
-
     return TrainingPerpEnv(df_15m, df_3m, feature_cols)
 
+def get_config(args) -> Dict[str, Any]:
+    config = {
+        'total_timesteps': 1_000_000,
+        'learning_rate': 3e-4,
+        'n_steps': 2048,
+        'batch_size': 64,
+        'n_epochs': 10,
+        'gamma': 0.99,
+        'gae_lambda': 0.95,
+        'clip_range': 0.2,
+        'ent_coef': 0.01
+    }
+    
+    if args.profile == 'high-util':
+        config.update({
+            'n_steps': 8192,
+            'batch_size': 512,
+        })
+    
+    # Explicit overrides
+    if args.n_steps is not None: config['n_steps'] = args.n_steps
+    if args.batch_size is not None: config['batch_size'] = args.batch_size
+    
+    return config
 
 def main():
-    # Directories setup
     os.makedirs(MODELS_DIR, exist_ok=True)
     os.makedirs(LOG_DIR, exist_ok=True)
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--allow-dummy-forecast", action="store_true", help="Use zero forecast features if missing.")
+    parser.add_argument("--profile", choices=['default', 'high-util'], default='default')
+    parser.add_argument("--n-steps", type=int, help="PPO n_steps")
+    parser.add_argument("--batch-size", type=int, help="PPO batch_size")
     args = parser.parse_args()
     
-    # 1. Load Data
+    cfg = get_config(args)
+    print(f"Configuration: {cfg}")
+    
     try:
         df_15m, df_3m = load_data(allow_dummy_forecast=args.allow_dummy_forecast)
     except FileNotFoundError as e:
         print(f"Fehler beim Laden der Daten: {e}")
         return
 
-    # 2. Setup Env
-    # Wir nutzen DummyVecEnv für Single-Thread Performance (oft schnell genug für Pandas)
-    # Für GPU-Sim/Parallelisierung bräuchten wir mehr Aufwand beim Data-Copying.
+    # Using DummyVecEnv as PerEnv is pandas-based and fast enough for single process usually.
+    # Parallelizing via SubprocVecEnv would require pickling large DataFrames which is inefficient.
     env = DummyVecEnv([lambda: make_env(df_15m, df_3m)])
     
-    # 3. Setup Agent
     print("Initialisiere PPO Agent...")
     policy_kwargs = dict(
-        net_arch=dict(pi=[256, 256], vf=[256, 256]), # Größeres Netz für 72 Dim Input
+        net_arch=dict(pi=[256, 256], vf=[256, 256]),
         activation_fn=torch.nn.Tanh,
     )
     
     model = PPO(
         "MlpPolicy",
         env,
-        learning_rate=LEARNING_RATE,
-        n_steps=N_STEPS,
-        batch_size=BATCH_SIZE,
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=0.01, # Exploration
+        learning_rate=cfg['learning_rate'],
+        n_steps=cfg['n_steps'],
+        batch_size=cfg['batch_size'],
+        n_epochs=cfg['n_epochs'],
+        gamma=cfg['gamma'],
+        gae_lambda=cfg['gae_lambda'],
+        clip_range=cfg['clip_range'],
+        ent_coef=cfg['ent_coef'],
         verbose=1,
         tensorboard_log=LOG_DIR,
         policy_kwargs=policy_kwargs,
         device="cuda" if torch.cuda.is_available() else "cpu"
     )
     
-    # Checkpoint Callback
     checkpoint_callback = CheckpointCallback(
         save_freq=50000,
         save_path=CHECKPOINT_DIR,
         name_prefix="ppo_model"
     )
     
-    # 4. Train
-    print(f"Starte Training für {TRAIN_TIMESTEPS} Timesteps...")
+    print(f"Starte Training für {cfg['total_timesteps']} Timesteps...")
     try:
-        model.learn(total_timesteps=TRAIN_TIMESTEPS, callback=checkpoint_callback, progress_bar=True)
+        model.learn(total_timesteps=cfg['total_timesteps'], callback=checkpoint_callback, progress_bar=True)
         print("Training abgeschlossen.")
     except KeyboardInterrupt:
         print("Training unterbrochen. Speichere Zwischenstand...")
     
-    # 5. Save Final Model
     save_path = os.path.join(MODELS_DIR, "ppo_policy_final")
     model.save(save_path)
     print(f"Modell gespeichert unter: {save_path}.zip")
-    
-    # Speichere auch die Normalisierung (VecNormalize), falls wir sie nutzen würden (hier nicht)
 
 
 if __name__ == "__main__":
