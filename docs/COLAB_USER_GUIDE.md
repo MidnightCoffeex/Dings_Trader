@@ -8,6 +8,9 @@
 
 ## 0) Colab Setup
 
+**Optional bequem:** Du kannst auch direkt das All-in-One Notebook öffnen:
+- `TraderHimSelf/notebooks/99_full_pipeline.ipynb`
+
 1. Google Colab öffnen
 2. `Runtime` → `Change runtime type`
    - Hardware accelerator: **GPU**

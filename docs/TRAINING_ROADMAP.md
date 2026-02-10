@@ -444,6 +444,7 @@ File: policy/train_ppo.py
 
 ### 9.4 Umzug vorbereiten (Notebooks + Bündelung) ✅
 - [x] Notebook-Kette angelegt: `00_setup.ipynb` … `07_eval.ipynb`
+- [x] All-in-One Alternative angelegt: `99_full_pipeline.ipynb`
 - [x] `00_setup.ipynb`: Drive mount + Store-Ordner + Symlinks (`data_raw`, `data_processed`, `models`, `logs`, `runs`, `checkpoints`)
 - [x] Notebook-Zellen rufen die bestehenden Scripts auf (kein doppelter Code)
 - [x] Pro Step klare Status-Ausgabe `OK:` / `ERROR:` + Logs unter `logs/colab/*.log`
