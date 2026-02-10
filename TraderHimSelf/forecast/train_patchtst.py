@@ -423,6 +423,9 @@ def train_model(args):
 
     best_val_loss = float('inf')
 
+    batch_log_every = int(getattr(args, 'log_every_batches', 0) or 0)
+    total_train_batches = len(train_loader)
+
     logger.info("Starting training...")
     for epoch in range(DEFAULT_EPOCHS):
         model.train()
@@ -451,8 +454,23 @@ def train_model(args):
             scaler.update()
             scheduler.step()
 
-            train_loss += float(loss.detach().item())
+            loss_value = float(loss.detach().item())
+            train_loss += loss_value
             train_batches += 1
+
+            if batch_log_every > 0:
+                should_log = (
+                    (batch_idx + 1) == 1
+                    or ((batch_idx + 1) % batch_log_every == 0)
+                    or ((batch_idx + 1) == total_train_batches)
+                )
+                if should_log:
+                    current_lr = float(scheduler.get_last_lr()[0])
+                    logger.info(
+                        f"Batch {batch_idx + 1}/{total_train_batches} | "
+                        f"Epoch {epoch + 1}/{DEFAULT_EPOCHS} | "
+                        f"Loss: {loss_value:.6f} | LR: {current_lr:.2e}"
+                    )
 
         if train_batches == 0:
             raise RuntimeError("No training batches produced. Dataset too short or batch size too large.")
@@ -590,6 +608,7 @@ if __name__ == "__main__":
     parser.add_argument('--prefetch-factor', type=int, help='Prefetch factor')
     parser.add_argument('--amp', type=str2bool, help='Use Automatic Mixed Precision')
     parser.add_argument('--compile', type=str2bool, help='Use torch.compile')
+    parser.add_argument('--log-every-batches', type=int, default=0, help='Log training batch stats every N batches (0=off)')
 
     args = parser.parse_args()
     
