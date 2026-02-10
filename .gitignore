@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+
+# Notebook artifacts
+.ipynb_checkpoints/
+
+# Data / models / logs
+TraderHimSelf/data_raw/
+TraderHimSelf/data_processed/
+TraderHimSelf/models/
+TraderHimSelf/runs/
+TraderHimSelf/checkpoints/
+TraderHimSelf/logs/
+
+# Generic large/generated
+*.parquet
+*.joblib
+*.pt
+*.zip
+*.sqlite
+*.log
+
+# Node/UI build output
+ui/node_modules/
+ui/.next/
+ui/dist/
+ui/tsconfig.tsbuildinfo
