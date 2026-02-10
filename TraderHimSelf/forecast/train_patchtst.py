@@ -11,6 +11,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import OneCycleLR
 import math
+from contextlib import nullcontext
 from typing import List, Optional
 import sys
 
@@ -292,6 +293,22 @@ def load_data() -> pd.DataFrame:
 
     df = feats[FEATURE_COLUMNS].copy()
     df["close"] = close.values
+
+    # Strict numeric sanity checks to avoid silent NaN training
+    numeric_cols = FEATURE_COLUMNS + ["close"]
+    invalid_mask = ~np.isfinite(df[numeric_cols].to_numpy(dtype=np.float64)).all(axis=1)
+    dropped = int(invalid_mask.sum())
+    if dropped > 0:
+        logger.warning(f"Dropping {dropped} rows with NaN/Inf in features or close before training.")
+        df = df.loc[~invalid_mask].copy()
+
+    min_required = LOOKBACK + FORECAST_HORIZON + 1
+    if len(df) < min_required:
+        raise ValueError(
+            f"Not enough clean rows after filtering ({len(df)} < {min_required}). "
+            "Rebuild features or extend dataset window."
+        )
+
     return df
 
 def get_config(args):
@@ -332,6 +349,25 @@ def get_config(args):
         config['persistent_workers'] = False
         
     return config
+
+def _make_autocast(device: torch.device, enabled: bool):
+    if not enabled or device.type != 'cuda':
+        return nullcontext()
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        return torch.amp.autocast(device_type='cuda', enabled=True)
+    return torch.cuda.amp.autocast(enabled=True)
+
+
+def _make_grad_scaler(device: torch.device, enabled: bool):
+    if device.type != 'cuda' or not enabled:
+        if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+            return torch.amp.GradScaler("cuda", enabled=False)
+        return torch.cuda.amp.GradScaler(enabled=False)
+
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler("cuda", enabled=True)
+    return torch.cuda.amp.GradScaler(enabled=True)
+
 
 def train_model(args):
     cfg = get_config(args)
@@ -380,48 +416,75 @@ def train_model(args):
 
     optimizer = AdamW(model.parameters(), lr=DEFAULT_LR)
     scheduler = OneCycleLR(optimizer, max_lr=DEFAULT_LR, steps_per_epoch=len(train_loader), epochs=DEFAULT_EPOCHS)
-    scaler = torch.cuda.amp.GradScaler(enabled=cfg['amp'])
-    
+    scaler = _make_grad_scaler(device, cfg['amp'])
+
     horizon_indices = [3, 15, 47, 95, 191]
     weights = [HORIZON_WEIGHTS[h] for h in HORIZON_STEPS]
-    
+
     best_val_loss = float('inf')
-    
+
     logger.info("Starting training...")
     for epoch in range(DEFAULT_EPOCHS):
         model.train()
-        train_loss = 0
-        for x, y in train_loader:
+        train_loss = 0.0
+        train_batches = 0
+
+        for batch_idx, (x, y) in enumerate(train_loader):
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            optimizer.zero_grad()
-            
-            with torch.cuda.amp.autocast(enabled=cfg['amp']):
+            if not torch.isfinite(x).all() or not torch.isfinite(y).all():
+                raise ValueError(f"Non-finite values detected in training batch {batch_idx}. Check features.parquet.")
+
+            optimizer.zero_grad(set_to_none=True)
+
+            with _make_autocast(device, cfg['amp']):
                 pred = model(x)
                 loss = quantile_loss(pred, y, weights=weights, horizon_indices=horizon_indices)
-            
+
+            if not torch.isfinite(loss):
+                raise FloatingPointError(
+                    f"Non-finite training loss at epoch {epoch + 1}, batch {batch_idx}. "
+                    "Try --amp false and/or smaller --batch-size."
+                )
+
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
-            
-            train_loss += loss.item()
-            
-        train_loss /= len(train_loader)
-        
+
+            train_loss += float(loss.detach().item())
+            train_batches += 1
+
+        if train_batches == 0:
+            raise RuntimeError("No training batches produced. Dataset too short or batch size too large.")
+        train_loss /= train_batches
+
         model.eval()
-        val_loss = 0
+        val_loss = 0.0
+        val_batches = 0
         with torch.no_grad():
-            for x, y in val_loader:
+            for batch_idx, (x, y) in enumerate(val_loader):
                 x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-                with torch.cuda.amp.autocast(enabled=cfg['amp']):
+                if not torch.isfinite(x).all() or not torch.isfinite(y).all():
+                    raise ValueError(f"Non-finite values detected in validation batch {batch_idx}.")
+
+                with _make_autocast(device, cfg['amp']):
                     pred = model(x)
                     loss = quantile_loss(pred, y, weights=weights, horizon_indices=horizon_indices)
-                val_loss += loss.item()
-        
-        val_loss /= len(val_loader)
-        
+
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(
+                        f"Non-finite validation loss at epoch {epoch + 1}, batch {batch_idx}."
+                    )
+
+                val_loss += float(loss.detach().item())
+                val_batches += 1
+
+        if val_batches == 0:
+            raise RuntimeError("No validation batches produced. Dataset split invalid.")
+        val_loss /= val_batches
+
         logger.info(f"Epoch {epoch+1}/{DEFAULT_EPOCHS} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
-        
+
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save(model.state_dict(), os.path.join(MODEL_DIR, "forecast_model.pt"))
@@ -429,8 +492,9 @@ def train_model(args):
 
 def precompute_features(args):
     cfg = get_config(args)
-    # For inference, we can often use larger batches
-    cfg['batch_size'] = cfg['batch_size'] * 2
+    # For inference, we can often use larger batches if no explicit override is provided.
+    if args.batch_size is None:
+        cfg['batch_size'] = cfg['batch_size'] * 2
     logger.info(f"Precompute Configuration: {cfg}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -453,27 +517,34 @@ def precompute_features(args):
     model = PatchTST().to(device)
     model_path = os.path.join(MODEL_DIR, "forecast_model.pt")
     if not os.path.exists(model_path):
-        logger.warning(f"Model not found at {model_path}. Using randomly initialized weights.")
-    else:
-        # Load weights before compile
-        model.load_state_dict(torch.load(model_path, map_location=device))
-        
+        raise FileNotFoundError(
+            f"Model not found at {model_path}. Run train mode successfully before precompute."
+        )
+
+    # Load weights before compile
+    model.load_state_dict(torch.load(model_path, map_location=device))
+
     if cfg['compile']:
         model = torch.compile(model)
-        
+
     model.eval()
-    
+
     all_features = []
-    
+
     with torch.no_grad():
-        for x, _ in loader:
+        for batch_idx, (x, _) in enumerate(loader):
             x = x.to(device, non_blocking=True)
-            with torch.cuda.amp.autocast(enabled=cfg['amp']):
+            if not torch.isfinite(x).all():
+                raise ValueError(f"Non-finite inputs during precompute at batch {batch_idx}.")
+
+            with _make_autocast(device, cfg['amp']):
                 preds = model(x)
-            preds_np = preds.float().cpu().numpy() # Ensure float32 for CPU
-            
+            if not torch.isfinite(preds).all():
+                raise FloatingPointError(f"Non-finite predictions during precompute at batch {batch_idx}.")
+
+            preds_np = preds.float().cpu().numpy()  # Ensure float32 for CPU
+
             # Compute features for batch (CPU bound)
-            # Parallelizing this part might be needed if it becomes bottleneck
             batch_feats = [compute_forecast_features(p) for p in preds_np]
             all_features.extend(batch_feats)
             
