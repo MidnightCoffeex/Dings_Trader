@@ -1,0 +1,324 @@
+"""
+TraderHimSelf/policy/train_ppo.py
+
+Implementiert Roadmap Schritt 9 — PPO Policy Training.
+Trainiert einen PPO Agenten auf dem PerpEnv.
+
+Funktionen:
+1. Lädt Daten (15m Candles, 3m Candles, Core Features, Forecast Features).
+2. Bereitet das Environment vor (Integration von Features in Observation).
+3. Trainiert Stable-Baselines3 PPO.
+4. Speichert das Modell.
+
+Anforderungen:
+- Observation Space (dim 72): Core (28) + Forecast (35) + Account (9).
+- Action Space: Direction, Size, Leverage, SL, TP.
+- Reward: Delta Equity - penalties.
+
+Nutzung:
+    python train_ppo.py
+"""
+
+import os
+import sys
+import argparse
+import numpy as np
+import pandas as pd
+import torch
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+from typing import List, Optional
+
+# Add project root to path to allow imports
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(current_dir)
+sys.path.append(project_root)
+
+from env.perp_env import PerpEnv
+from feature_engine import FEATURE_COLUMNS as CORE_FEATURE_COLUMNS
+
+# --- CONFIG ---
+DATA_DIR = os.path.join(project_root, "data_processed")
+MODELS_DIR = os.path.join(project_root, "models")
+LOG_DIR = os.path.join(project_root, "runs/ppo_logs")
+CHECKPOINT_DIR = os.path.join(project_root, "checkpoints/ppo")
+
+OS_OBS_DIM = 72
+CORE_DIM = 28
+FORECAST_DIM = 35
+ACCOUNT_DIM = 9
+
+TRAIN_TIMESTEPS = 1_000_000  # Beispielwert, anpassen nach Bedarf
+LEARNING_RATE = 3e-4
+BATCH_SIZE = 64
+N_STEPS = 2048  # Steps per update
+
+# --- FORECAST FEATURE COLUMNS ---
+# Da die Namen nicht fix definiert waren, generieren wir sie hier generisch oder erwarten sie.
+# Wir nehmen an, sie heißen forecast_0 ... forecast_34
+FORECAST_COLUMNS = [f"forecast_{i}" for i in range(FORECAST_DIM)]
+
+class TrainingPerpEnv(PerpEnv):
+    """
+    Wrapper / Subclass von PerpEnv für das Training.
+    Implementiert _get_obs korrekt, indem es die echten Features aus dem DataFrame liest.
+    """
+    def __init__(self, df_15m: pd.DataFrame, df_3m: pd.DataFrame, feature_cols: List[str]):
+        super().__init__(df_15m, df_3m)
+        self.feature_cols = feature_cols
+        
+        # Validierung
+        assert len(self.feature_cols) == (CORE_DIM + FORECAST_DIM), \
+            f"Expected {CORE_DIM + FORECAST_DIM} feature columns, got {len(self.feature_cols)}"
+            
+        # Ensure Observation Space matches
+        # PerpEnv setzt ihn bereits auf 72, aber sicher ist sicher
+        self.observation_space = self.observation_space # Box(72,)
+
+    def _get_obs(self):
+        """
+        Holt den Observation Vector für den aktuellen Step.
+        Aufbau: [Core Features (28) | Forecast Features (35) | Account State (9)]
+        """
+        # 1. ML Features aus DataFrame holen
+        # Wir greifen direkt auf die Zeile zu. df_15m sollte die Features enthalten.
+        # .iloc ist etwas langsam, aber für Training akzeptabel (Vectorized Env hilft).
+        # Optimierung: self.features_np array nutzen
+        if not hasattr(self, 'features_np'):
+             self.features_np = self.df_15m[self.feature_cols].values.astype(np.float32)
+        
+        # Check Bounds
+        idx = self.current_step
+        if idx >= len(self.features_np):
+            # Fallback am Ende (sollte durch done handled sein)
+            ml_features = np.zeros(CORE_DIM + FORECAST_DIM, dtype=np.float32)
+        else:
+            ml_features = self.features_np[idx]
+            
+        # 2. Account State (nutzt Logik der Parent Class, aber wir müssen den Code duplizieren 
+        # oder die Parent Methode aufrufen, wenn sie nur den Account Part zurückgibt?
+        # PerpEnv._get_obs gibt zeros + account zurück.
+        # Wir können den Account Part berechnen.
+        
+        # Copy-Paste der Account-State Logik aus PerpEnv um sicher zu gehen und sauber zu mergen.
+        # (Alternativ: PerpEnv refactorn, aber ich soll nur dieses File schreiben)
+        
+        pos_count = len(self.open_positions)
+        major_side = 0
+        if pos_count > 0:
+            major_side = 1 if self.open_positions[0].side == 'long' else 2
+            
+        total_margin = sum(p.margin_used for p in self.open_positions)
+        total_notional = sum(p.notional for p in self.open_positions)
+        total_upnl = sum(p.current_pnl for p in self.open_positions)
+        
+        equity = self.equity if self.equity > 0 else 1.0
+        
+        exp_open_pct = total_margin / equity
+        not_open_pct = total_notional / equity
+        upnl_open_pct = total_upnl / equity
+        
+        time_in_trade_max = 0
+        if pos_count > 0:
+            time_in_trade_max = max(p.time_in_trade_steps_15m for p in self.open_positions)
+            
+        # Import TradingConfig constants via instance if possible or hardcode match
+        # PerpEnv nutzt TradingConfig.MAX_HOLD_STEPS = 192
+        time_left_min = 192 - time_in_trade_max
+        
+        liq_buffer_min = 1.0 # Placeholder wie in PerpEnv
+        
+        avail_exp_pct = (self.equity * self.max_exposure_pct - total_margin) / equity
+        
+        account_vec = np.array([
+            pos_count, major_side, exp_open_pct, not_open_pct, upnl_open_pct,
+            time_in_trade_max, time_left_min, liq_buffer_min, avail_exp_pct
+        ], dtype=np.float32)
+        
+        return np.concatenate([ml_features, account_vec])
+
+
+def _rename_fc_feat_columns(df: pd.DataFrame) -> pd.DataFrame:
+    fc_cols = [c for c in df.columns if c.startswith("fc_feat_")]
+    if not fc_cols:
+        return df
+    renamed = {c: c.replace("fc_feat_", "forecast_") for c in fc_cols}
+    return df.rename(columns=renamed)
+
+
+def load_data(*, allow_dummy_forecast: bool = False):
+    """Lädt und mergt alle benötigten Daten."""
+    print("Lade Daten...")
+    
+    # 1. Candles 15m
+    p_15m = os.path.join(DATA_DIR, "aligned_15m.parquet")
+    if not os.path.exists(p_15m):
+        raise FileNotFoundError(f"{p_15m} nicht gefunden. Bitte erst build_dataset.py ausführen.")
+    df_15m = pd.read_parquet(p_15m)
+    
+    # 2. Candles 3m
+    p_3m = os.path.join(DATA_DIR, "aligned_3m.parquet")
+    if not os.path.exists(p_3m):
+        raise FileNotFoundError(f"{p_3m} nicht gefunden.")
+    df_3m = pd.read_parquet(p_3m)
+    
+    # 3. Core Features
+    p_feat = os.path.join(DATA_DIR, "features.parquet")
+    if not os.path.exists(p_feat):
+        raise FileNotFoundError(f"{p_feat} nicht gefunden. Bitte feature_engine.py ausführen.")
+    df_feat = pd.read_parquet(p_feat)
+    missing_core = [c for c in CORE_FEATURE_COLUMNS if c not in df_feat.columns]
+    if missing_core:
+        raise ValueError(f"features.parquet missing core columns: {missing_core}")
+    
+    # 4. Forecast Features
+    p_forecast = os.path.join(DATA_DIR, "forecast_features.parquet")
+    if not os.path.exists(p_forecast):
+        if allow_dummy_forecast:
+            print(f"WARNUNG: {p_forecast} nicht gefunden. Dummy-Forecast-Features werden erstellt.")
+            df_forecast = pd.DataFrame(0.0, index=df_feat.index, columns=FORECAST_COLUMNS)
+        else:
+            raise FileNotFoundError(
+                f"{p_forecast} nicht gefunden. Bitte train_patchtst.py precompute ausführen "
+                "oder --allow-dummy-forecast verwenden."
+            )
+    else:
+        df_forecast = pd.read_parquet(p_forecast)
+        df_forecast = _rename_fc_feat_columns(df_forecast)
+        missing_fc = [c for c in FORECAST_COLUMNS if c not in df_forecast.columns]
+        if missing_fc:
+            if allow_dummy_forecast:
+                print(f"WARNUNG: Forecast-Spalten fehlen: {missing_fc[:5]}... Dummy ergänzt.")
+                for c in missing_fc:
+                    df_forecast[c] = 0.0
+            else:
+                raise ValueError(f"Missing forecast columns: {missing_fc}")
+        
+    # Merge Features into df_15m
+    # Wir nehmen an, der Index ist aligned (DatetimeIndex)
+    print("Merge DataFrames...")
+    
+    # Check consistency
+    common_idx = df_15m.index.intersection(df_feat.index).intersection(df_forecast.index)
+    if len(common_idx) < 1000:
+        print(f"Warnung: Sehr wenig gemeinsame Datenpunkte ({len(common_idx)}). Check Alignment.")
+        
+    df_15m = df_15m.loc[common_idx].copy()
+    df_feat = df_feat.loc[common_idx].copy()
+    df_forecast = df_forecast.loc[common_idx].copy()
+    
+    # Add columns
+    for col in CORE_FEATURE_COLUMNS:
+        df_15m[col] = df_feat[col]
+        
+    for col in FORECAST_COLUMNS:
+        if col not in df_forecast.columns:
+            raise ValueError(f"Missing forecast column after rename: {col}")
+        df_15m[col] = df_forecast[col]
+            
+    # ATR Alias für Environment
+    if 'atr_14' in df_15m.columns:
+        df_15m['atr'] = df_15m['atr_14']
+    else:
+        # Fallback approximation
+        df_15m['atr'] = df_15m['close'] * 0.01 
+        
+    # Align 3m data to 15m time span via slot_15m mapping
+    if "slot_15m" not in df_3m.columns:
+        raise ValueError("aligned_3m.parquet missing required column: slot_15m")
+    if "open_time_ms" not in df_15m.columns:
+        raise ValueError("aligned_15m.parquet missing required column: open_time_ms")
+    valid_slots = set(df_15m["open_time_ms"].values)
+    df_3m = df_3m[df_3m["slot_15m"].isin(valid_slots)].copy()
+
+    print(f"Daten geladen: {len(df_15m)} 15m Steps, {len(df_3m)} 3m Steps.")
+    return df_15m, df_3m
+
+
+def make_env(df_15m, df_3m):
+    """Factory function für SB3."""
+    # Definiere Feature Liste
+    # Prüfe ob Forecast Features da sind, sonst Nullen füllen oder Error
+    feature_cols = CORE_FEATURE_COLUMNS + FORECAST_COLUMNS
+    
+    # Check if cols exist
+    missing = [c for c in feature_cols if c not in df_15m.columns]
+    if missing:
+        # Wenn wir Dummy Forecasts nutzen, sollten sie da sein.
+        # Falls Core fehlt -> Error
+        raise ValueError(f"Missing columns in df_15m: {missing[:5]}...")
+
+    return TrainingPerpEnv(df_15m, df_3m, feature_cols)
+
+
+def main():
+    # Directories setup
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--allow-dummy-forecast", action="store_true", help="Use zero forecast features if missing.")
+    args = parser.parse_args()
+    
+    # 1. Load Data
+    try:
+        df_15m, df_3m = load_data(allow_dummy_forecast=args.allow_dummy_forecast)
+    except FileNotFoundError as e:
+        print(f"Fehler beim Laden der Daten: {e}")
+        return
+
+    # 2. Setup Env
+    # Wir nutzen DummyVecEnv für Single-Thread Performance (oft schnell genug für Pandas)
+    # Für GPU-Sim/Parallelisierung bräuchten wir mehr Aufwand beim Data-Copying.
+    env = DummyVecEnv([lambda: make_env(df_15m, df_3m)])
+    
+    # 3. Setup Agent
+    print("Initialisiere PPO Agent...")
+    policy_kwargs = dict(
+        net_arch=dict(pi=[256, 256], vf=[256, 256]), # Größeres Netz für 72 Dim Input
+        activation_fn=torch.nn.Tanh,
+    )
+    
+    model = PPO(
+        "MlpPolicy",
+        env,
+        learning_rate=LEARNING_RATE,
+        n_steps=N_STEPS,
+        batch_size=BATCH_SIZE,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        ent_coef=0.01, # Exploration
+        verbose=1,
+        tensorboard_log=LOG_DIR,
+        policy_kwargs=policy_kwargs,
+        device="cuda" if torch.cuda.is_available() else "cpu"
+    )
+    
+    # Checkpoint Callback
+    checkpoint_callback = CheckpointCallback(
+        save_freq=50000,
+        save_path=CHECKPOINT_DIR,
+        name_prefix="ppo_model"
+    )
+    
+    # 4. Train
+    print(f"Starte Training für {TRAIN_TIMESTEPS} Timesteps...")
+    try:
+        model.learn(total_timesteps=TRAIN_TIMESTEPS, callback=checkpoint_callback, progress_bar=True)
+        print("Training abgeschlossen.")
+    except KeyboardInterrupt:
+        print("Training unterbrochen. Speichere Zwischenstand...")
+    
+    # 5. Save Final Model
+    save_path = os.path.join(MODELS_DIR, "ppo_policy_final")
+    model.save(save_path)
+    print(f"Modell gespeichert unter: {save_path}.zip")
+    
+    # Speichere auch die Normalisierung (VecNormalize), falls wir sie nutzen würden (hier nicht)
+
+
+if __name__ == "__main__":
+    main()

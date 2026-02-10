@@ -1,0 +1,24 @@
+# Dings-Trader Requirements
+# Installieren in Google Colab mit: !pip install -r requirements.txt
+
+# Core
+torch>=2.0.0
+numpy>=1.24.0
+pandas>=2.0.0
+pyarrow>=12.0.0
+scikit-learn
+joblib
+
+# RL & ML
+stable-baselines3>=2.0.0
+gymnasium>=0.28.0
+
+# Data & API
+requests>=2.28.0
+python-binance>=1.0.17
+
+# Optional: für Forecast-Modelle
+einops>=0.6.0
+
+# Utils
+tqdm>=4.65.0
