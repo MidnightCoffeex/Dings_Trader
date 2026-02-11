@@ -111,8 +111,11 @@ class TrainingPerpEnv(PerpEnv):
             pos_count, major_side, exp_open_pct, not_open_pct, upnl_open_pct,
             time_in_trade_max, time_left_min, liq_buffer_min, avail_exp_pct
         ], dtype=np.float32)
-        
-        return np.concatenate([ml_features, account_vec])
+
+        obs = np.concatenate([ml_features, account_vec]).astype(np.float32)
+        if not np.isfinite(obs).all():
+            raise ValueError(f"Non-finite observation at step={idx}. Check feature/forecast preprocessing.")
+        return obs
 
 
 def _rename_fc_feat_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -211,8 +214,30 @@ def load_data(*, allow_dummy_forecast: bool = False):
     if 'atr_14' in df_15m.columns:
         df_15m['atr'] = df_15m['atr_14']
     else:
-        df_15m['atr'] = df_15m['close'] * 0.01 
-        
+        df_15m['atr'] = df_15m['close'] * 0.01
+
+    # Strict row cleanup for PPO: no NaN/Inf in observation-driving columns.
+    required_cols = [
+        'open_time_ms', 'open', 'high', 'low', 'close', 'atr'
+    ] + CORE_FEATURE_COLUMNS + FORECAST_COLUMNS
+
+    missing_req = [c for c in required_cols if c not in df_15m.columns]
+    if missing_req:
+        raise ValueError(f"df_15m missing required columns for PPO: {missing_req[:10]}")
+
+    req_num = df_15m[required_cols].apply(pd.to_numeric, errors='coerce')
+    valid_mask = np.isfinite(req_num.to_numpy(dtype=np.float64)).all(axis=1)
+    dropped_rows = int((~valid_mask).sum())
+    if dropped_rows > 0:
+        print(f"WARN: dropping {dropped_rows} 15m rows with NaN/Inf before PPO training")
+        df_15m = df_15m.loc[valid_mask].copy()
+
+    if len(df_15m) < 5000:
+        raise ValueError(
+            f"Too few clean 15m rows for PPO ({len(df_15m)}). "
+            "Rebuild dataset/features/forecast and ensure full history is present."
+        )
+
     if "slot_15m" not in df_3m.columns:
         raise ValueError("aligned_3m.parquet missing required column: slot_15m")
     if "open_time_ms" not in df_15m.columns:
@@ -221,6 +246,9 @@ def load_data(*, allow_dummy_forecast: bool = False):
     # Normalize slot_15m to ms so it matches 15m open_time_ms domain.
     df_3m = df_3m.copy()
     df_3m["slot_15m"] = _slot15m_to_ms(df_3m["slot_15m"])
+
+    # Remove rows with invalid slot values before matching.
+    df_3m = df_3m[np.isfinite(pd.to_numeric(df_3m["slot_15m"], errors='coerce'))].copy()
 
     valid_slots = set(pd.to_numeric(df_15m["open_time_ms"], errors="coerce").astype("int64").values)
     df_3m = df_3m[df_3m["slot_15m"].isin(valid_slots)].copy()
