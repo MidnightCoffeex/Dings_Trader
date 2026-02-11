@@ -31,7 +31,7 @@ logger = logging.getLogger("Forecast-PatchTST")
 # Constants (Model Architecture & Data)
 LOOKBACK = 512
 FORECAST_HORIZON = 192  # Max horizon (48h * 4 steps/h)
-INPUT_CHANNELS = 28
+INPUT_CHANNELS = len(FEATURE_COLUMNS)
 QUANTILES = [0.1, 0.5, 0.9]
 HORIZON_STEPS = [4, 16, 48, 96, 192]  # 1h, 4h, 12h, 24h, 48h
 HORIZON_WEIGHTS = {4: 1.0, 16: 1.0, 48: 0.8, 96: 0.6, 192: 0.4}
@@ -44,7 +44,7 @@ DEFAULT_LR = 1e-4
 DATA_DIR = os.path.join(BASE_DIR, "data_processed")
 MODEL_DIR = os.path.join(BASE_DIR, "models")
 SCALER_PATH = os.path.join(DATA_DIR, "scaler.pkl")
-DATA_FILE_FEATURES = os.path.join(DATA_DIR, "features.parquet")      # scaled 28 core features
+DATA_FILE_FEATURES = os.path.join(DATA_DIR, "features.parquet")      # scaled core features (FEATURE_COLUMNS)
 DATA_FILE_15M_RAW = os.path.join(DATA_DIR, "aligned_15m.parquet")    # for 'close' prices
 OUTPUT_FEATURES_PATH = os.path.join(DATA_DIR, "forecast_features.parquet")
 
@@ -56,10 +56,10 @@ class ForecastDataset(Dataset):
     def __init__(self, df, lookback=LOOKBACK, forecast_horizon=FORECAST_HORIZON, mode='train', feature_cols=None):
         """
         df: DataFrame indexed by UTC timestamps. Must contain:
-            - 28 core feature columns (scaled)
+            - core feature columns (scaled; see feature_engine.FEATURE_COLUMNS)
             - 'close' column (raw close prices)
         mode: 'train', 'val', 'test', 'inference'
-        feature_cols: explicit list of the 28 feature columns (recommended)
+        feature_cols: explicit list of the feature columns (recommended)
         """
         self.lookback = lookback
         self.forecast_horizon = forecast_horizon
@@ -134,7 +134,7 @@ class PatchEmbedding(nn.Module):
         return x
 
 class PatchTST(nn.Module):
-    def __init__(self, input_dim=28, lookback=512, forecast_len=192, 
+    def __init__(self, input_dim=INPUT_CHANNELS, lookback=512, forecast_len=192, 
                  patch_len=16, stride=8, d_model=128, n_heads=4, n_layers=3, dropout=0.1):
         super().__init__()
         self.input_dim = input_dim

@@ -27,7 +27,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from feature_engine import compute_core_features, parity_test
+from feature_engine import compute_core_features, parity_test, FEATURE_COLUMNS
 
 
 def _make_synth(n: int = 2000, seed: int = 7) -> pd.DataFrame:
@@ -58,9 +58,9 @@ def main() -> None:
     parity_test(candles, funding=None, buffer_size=10_000_000, sample_points=50, atol=1e-10)
 
     feats = compute_core_features(candles, None)
-    assert feats.shape[1] == 28
+    assert feats.shape[1] == len(FEATURE_COLUMNS)
 
-    print("✅ parity ok; 28 features")
+    print(f"✅ parity ok; {len(FEATURE_COLUMNS)} features")
 
 
 if __name__ == "__main__":

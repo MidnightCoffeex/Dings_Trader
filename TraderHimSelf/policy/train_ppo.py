@@ -11,7 +11,7 @@ Funktionen:
 4. Speichert das Modell.
 
 Anforderungen:
-- Observation Space (dim 72): Core (28) + Forecast (35) + Account (9).
+- Observation Space (dim = CORE_DIM + 35 + 9): Core (FEATURE_COLUMNS) + Forecast (35) + Account (9).
 - Action Space: Direction, Size, Leverage, SL, TP.
 - Reward: Delta Equity - penalties.
 
@@ -44,10 +44,10 @@ MODELS_DIR = os.path.join(project_root, "models")
 LOG_DIR = os.path.join(project_root, "runs/ppo_logs")
 CHECKPOINT_DIR = os.path.join(project_root, "checkpoints/ppo")
 
-OS_OBS_DIM = 72
-CORE_DIM = 28
 FORECAST_DIM = 35
 ACCOUNT_DIM = 9
+CORE_DIM = len(CORE_FEATURE_COLUMNS)
+OS_OBS_DIM = CORE_DIM + FORECAST_DIM + ACCOUNT_DIM
 
 # --- FORECAST FEATURE COLUMNS ---
 FORECAST_COLUMNS = [f"forecast_{i}" for i in range(FORECAST_DIM)]
@@ -65,8 +65,8 @@ class TrainingPerpEnv(PerpEnv):
         assert len(self.feature_cols) == (CORE_DIM + FORECAST_DIM), \
             f"Expected {CORE_DIM + FORECAST_DIM} feature columns, got {len(self.feature_cols)}"
             
-        # Ensure Observation Space matches
-        self.observation_space = self.observation_space # Box(72,)
+        # Ensure Observation Space matches (PerpEnv sets it based on dims)
+        self.observation_space = self.observation_space
 
     def _get_obs(self):
         """

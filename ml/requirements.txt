@@ -1,0 +1,11 @@
+pandas
+numpy
+scikit-learn
+lightgbm
+pyarrow
+tqdm
+requests
+matplotlib
+seaborn
+pydantic
+joblib
