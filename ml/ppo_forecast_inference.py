@@ -12,14 +12,34 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import requests
+import time
 from typing import Dict, Any, Optional, List
 from stable_baselines3 import PPO
 
-# Ensure we can import TraderHimSelf modules
-# Assuming this file is in projects/dings-trader/ml, we want to access projects/dings-trader/
+# Ensure we can import TraderHimSelf and ml modules
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if PROJECT_ROOT not in sys.path:
-    sys.path.append(PROJECT_ROOT)
+ML_DIR = os.path.dirname(os.path.abspath(__file__))
+for d in [PROJECT_ROOT, ML_DIR]:
+    if d not in sys.path:
+        sys.path.append(d)
+
+# DB-backed model package registry (forecast + PPO artifacts)
+try:
+    from db import init_db, get_model_package, ensure_default_model_package, set_model_package_warmup_status
+
+    init_db()
+    ensure_default_model_package(
+        package_id="ppo_v1",
+        name="PPO v1 (ML)",
+        forecast_rel_path=os.path.join("TraderHimSelf", "models", "forecast_model.pt"),
+        ppo_rel_path=os.path.join("TraderHimSelf", "models", "ppo_policy_final.zip"),
+        status="READY",
+        warmup_required=True,
+    )
+except Exception as _e:
+    # Inference can still run in standalone mode; registry features will be disabled.
+    get_model_package = None  # type: ignore
+    set_model_package_warmup_status = None  # type: ignore
 
 logger = logging.getLogger("PPOInference")
 # Configure logger if not already configured
@@ -148,33 +168,60 @@ def compute_forecast_features(forecast_seq):
     return all_feats
 
 class PPOForecastInference:
-    def __init__(self):
+    def __init__(
+        self,
+        model_package_id: str = "ppo_v1",
+        forecast_rel_path: str | None = None,
+        ppo_rel_path: str | None = None,
+    ):
+        self.model_package_id = model_package_id
         self.scaler = None
         self.forecast_model = None
         self.ppo_model = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._cache = {}
+        self._cache_ttl = 15  # seconds
+
+        # Resolve artifact paths via registry if available
+        if forecast_rel_path is None or ppo_rel_path is None:
+            pkg = get_model_package(model_package_id) if callable(get_model_package) else None
+            
+            if pkg:
+                forecast_rel_path = pkg.get("forecast_rel_path")
+                ppo_rel_path = pkg.get("ppo_rel_path")
+            elif model_package_id == "ppo_v1":
+                # Hardcoded fallback only for default model
+                forecast_rel_path = os.path.join("TraderHimSelf", "models", "forecast_model.pt")
+                ppo_rel_path = os.path.join("TraderHimSelf", "models", "ppo_policy_final.zip")
+            else:
+                raise ValueError(f"Model package '{model_package_id}' not found in registry and no default paths provided.")
+
+        if forecast_rel_path is None or ppo_rel_path is None:
+             raise ValueError(f"Could not resolve paths for model package '{model_package_id}'")
+
+        self.forecast_path = os.path.join(PROJECT_ROOT, forecast_rel_path)
+        self.ppo_path = os.path.join(PROJECT_ROOT, ppo_rel_path)
+
         self._load_artifacts()
 
     def _load_artifacts(self):
         base_dir = os.path.join(PROJECT_ROOT, "TraderHimSelf")
         scaler_path = os.path.join(base_dir, "data_processed", "scaler.pkl")
-        forecast_path = os.path.join(base_dir, "models", "forecast_model.pt")
-        ppo_path = os.path.join(base_dir, "models", "ppo_policy_final.zip")
 
         if not os.path.exists(scaler_path):
-             raise FileNotFoundError(f"Scaler not found at {scaler_path}")
-        if not os.path.exists(forecast_path):
-             raise FileNotFoundError(f"Forecast model not found at {forecast_path}")
-        if not os.path.exists(ppo_path):
-             raise FileNotFoundError(f"PPO model not found at {ppo_path}")
+            raise FileNotFoundError(f"Scaler not found at {scaler_path}")
+        if not os.path.exists(self.forecast_path):
+            raise FileNotFoundError(f"Forecast model not found at {self.forecast_path}")
+        if not os.path.exists(self.ppo_path):
+            raise FileNotFoundError(f"PPO model not found at {self.ppo_path}")
 
         logger.info(f"Loading Scaler from {scaler_path}...")
         self.scaler = joblib.load(scaler_path)
-        
-        logger.info(f"Loading Forecast Model from {forecast_path}...")
+
+        logger.info(f"Loading Forecast Model from {self.forecast_path}...")
         self.forecast_model = PatchTST()
         # Handle loading: map_location to device
-        state_dict = torch.load(forecast_path, map_location=self.device)
+        state_dict = torch.load(self.forecast_path, map_location=self.device)
         
         # Normalize state dict keys (remove _orig_mod prefix)
         new_state_dict = {}
@@ -188,11 +235,26 @@ class PPOForecastInference:
         self.forecast_model.to(self.device)
         self.forecast_model.eval()
 
-        logger.info(f"Loading PPO Model from {ppo_path}...")
+        logger.info(f"Loading PPO Model from {self.ppo_path}...")
         # SB3 PPO load
-        self.ppo_model = PPO.load(ppo_path, device=self.device)
+        self.ppo_model = PPO.load(self.ppo_path, device=self.device)
         
         logger.info("All inference artifacts loaded.")
+
+    def _get_cached(self, symbol: str):
+        entry = self._cache.get(symbol)
+        if not entry:
+            return None
+        if entry["expires_at"] < time.time():
+            self._cache.pop(symbol, None)
+            return None
+        return entry["value"]
+
+    def _set_cache(self, symbol: str, value: Dict[str, Any]):
+        self._cache[symbol] = {
+            "expires_at": time.time() + self._cache_ttl,
+            "value": value,
+        }
 
     def fetch_candles(self, symbol="BTCUSDT") -> pd.DataFrame:
         """
@@ -256,7 +318,22 @@ class PPOForecastInference:
         Main inference method.
         Returns dict with signal, confidence, etc.
         """
+        symbol = symbol.upper()
+        if account_state is None:
+            cached = self._get_cached(symbol)
+            if cached:
+                return cached
         try:
+            # Registry warmup status update (best-effort)
+            pkg = None
+            if callable(get_model_package) and callable(set_model_package_warmup_status):
+                try:
+                    pkg = get_model_package(self.model_package_id)
+                    if pkg and int(pkg.get("warmup_required", 0)) == 1 and pkg.get("warmup_status") == "PENDING":
+                        set_model_package_warmup_status(self.model_package_id, "RUNNING", completed=False)
+                except Exception:
+                    pkg = None
+
             # 1. Get Data
             df = self.fetch_candles(symbol)
             
@@ -297,6 +374,9 @@ class PPOForecastInference:
             
             # 5. Compute Forecast Features (35 dim)
             forecast_feats = compute_forecast_features(forecast_out_np)
+            
+            # Convert forecast_out_np to list for JSON response
+            forecast_values = forecast_out_np.tolist()
             
             # 6. Build PPO Observation
             # [Core28 (latest) + Forecast35 + Account9] = 72
@@ -340,12 +420,13 @@ class PPOForecastInference:
                 
             current_price = float(df['close'].iloc[-1])
             
-            return {
+            result = {
                 "signal": direction,
                 "confidence": int(confidence),
                 "sentiment": sentiment,
                 "current_price": current_price,
                 "action_raw": action.tolist(),
+                "forecast_values": forecast_values,
                 "diagnostics": {
                     "lookback_rows_used": len(valid_feats),
                     "warmup_ready": True,
@@ -354,23 +435,44 @@ class PPOForecastInference:
                 }
             }
 
+            if pkg and int(pkg.get("warmup_required", 0)) == 1 and callable(set_model_package_warmup_status):
+                try:
+                    # Mark warmup as completed on first successful inference
+                    if pkg.get("warmup_status") != "DONE":
+                        set_model_package_warmup_status(self.model_package_id, "DONE", completed=True)
+                except Exception:
+                    pass
+
+            if account_state is None and "error" not in result:
+                self._set_cache(symbol, result)
+
+            return result
+
         except Exception as e:
             logger.error(f"Inference failed: {e}", exc_info=True)
+            if pkg and int(pkg.get("warmup_required", 0)) == 1 and callable(set_model_package_warmup_status):
+                try:
+                    set_model_package_warmup_status(self.model_package_id, "FAILED", completed=False, error_msg=str(e))
+                except Exception:
+                    pass
             return {
-                "signal": "ERROR", 
-                "confidence": 0, 
+                "signal": "ERROR",
+                "confidence": 0,
                 "error": str(e),
-                "current_price": 0.0
+                "current_price": 0.0,
             }
 
-# Singleton accessor
-_inference_instance = None
 
-def get_inference():
-    global _inference_instance
-    if _inference_instance is None:
-        _inference_instance = PPOForecastInference()
-    return _inference_instance
+# Multi-package singleton accessor
+_inference_instances: Dict[str, PPOForecastInference] = {}
+
+
+def get_inference(model_package_id: str = "ppo_v1") -> PPOForecastInference:
+    instance = _inference_instances.get(model_package_id)
+    if instance is None:
+        instance = PPOForecastInference(model_package_id=model_package_id)
+        _inference_instances[model_package_id] = instance
+    return instance
 
 if __name__ == "__main__":
     # Smoke test
