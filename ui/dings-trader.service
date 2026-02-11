@@ -1,0 +1,15 @@
+[Unit]
+Description=Dings-Trader Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=maxim
+WorkingDirectory=/home/maxim/.openclaw/workspace/projects/dings-trader/ui
+ExecStart=/usr/bin/npm start -- --hostname 0.0.0.0 --port 3000
+Restart=always
+RestartSec=3
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target

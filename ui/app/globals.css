@@ -1,0 +1,104 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+  Dark-first theme with purple accent.
+  Uses shadcn/ui CSS variables (hsl).
+*/
+:root {
+  --radius: 12px;
+
+  --background: 240 10% 4%;
+  --foreground: 0 0% 98%;
+
+  --card: 240 10% 6%;
+  --card-foreground: 0 0% 98%;
+
+  --popover: 240 10% 6%;
+  --popover-foreground: 0 0% 98%;
+
+  --primary: 270 90% 66%;
+  --primary-foreground: 0 0% 100%;
+
+  --secondary: 240 6% 14%;
+  --secondary-foreground: 0 0% 98%;
+
+  --muted: 240 6% 14%;
+  --muted-foreground: 240 5% 64%;
+
+  --accent: 270 90% 66%;
+  --accent-foreground: 0 0% 100%;
+
+  --destructive: 0 72% 51%;
+  --destructive-foreground: 0 0% 98%;
+
+  --border: 240 6% 18%;
+  --input: 240 6% 18%;
+  --ring: 270 90% 66%;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+  font-size: 14px;
+}
+
+/* Responsive font scaling for high-resolution screens */
+@media (min-width: 1536px) {
+  html {
+    font-size: 15px;
+  }
+}
+
+@media (min-width: 1920px) {
+  html {
+    font-size: 16px;
+  }
+}
+
+/* Subtle grid + vignette background */
+.bg-dashboard {
+  background-image:
+    radial-gradient(1200px 600px at 20% 0%, hsla(270, 90%, 66%, 0.10), transparent 60%),
+    radial-gradient(900px 500px at 80% 10%, hsla(200, 90%, 60%, 0.06), transparent 55%),
+    linear-gradient(to bottom, hsla(0, 0%, 100%, 0.03), transparent 60%),
+    linear-gradient(hsla(0, 0%, 100%, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, hsla(0, 0%, 100%, 0.04) 1px, transparent 1px);
+  background-size: auto, auto, auto, 52px 52px, 52px 52px;
+  background-position: 0 0, 0 0, 0 0, -1px -1px, -1px -1px;
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+}
+
+/* Symbiomorphose Branding */
+@keyframes pulse-purple {
+  0%, 100% {
+    filter: drop-shadow(0 0 2px hsla(270, 90%, 66%, 0.4));
+  }
+  50% {
+    filter: drop-shadow(0 0 12px hsla(270, 90%, 66%, 0.8));
+  }
+}
+
+.animate-dna {
+  animation: pulse-purple 3s ease-in-out infinite;
+}
+
+.card-glow {
+  transition: all 0.3s ease;
+}
+
+.card-glow:hover {
+  box-shadow: 0 0 20px -5px hsla(270, 90%, 66%, 0.3);
+  border-color: hsla(270, 90%, 66%, 0.4);
+}
