@@ -19,7 +19,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
     sys.path.append(BASE_DIR)
 
-from feature_engine import FEATURE_COLUMNS
+from feature_engine_train30 import FEATURE_COLUMNS_TRAIN30 as FEATURE_COLUMNS
 
 # Configure logging
 logging.basicConfig(
@@ -41,14 +41,17 @@ DEFAULT_EPOCHS = 20
 DEFAULT_LR = 1e-4
 
 # Paths
-DATA_DIR = os.path.join(BASE_DIR, "data_processed")
+BASE_DATA_DIR = os.path.join(BASE_DIR, "data_processed")
+TRAIN30_DIR = os.path.join(BASE_DATA_DIR, "train30")  # separate training artifacts; live stays untouched
 MODEL_DIR = os.path.join(BASE_DIR, "models")
-SCALER_PATH = os.path.join(DATA_DIR, "scaler.pkl")
-DATA_FILE_FEATURES = os.path.join(DATA_DIR, "features.parquet")      # scaled core features (FEATURE_COLUMNS)
-DATA_FILE_15M_RAW = os.path.join(DATA_DIR, "aligned_15m.parquet")    # for 'close' prices
-OUTPUT_FEATURES_PATH = os.path.join(DATA_DIR, "forecast_features.parquet")
+
+SCALER_PATH = os.path.join(TRAIN30_DIR, "scaler.pkl")
+DATA_FILE_FEATURES = os.path.join(TRAIN30_DIR, "features.parquet")      # scaled core features (30D; FEATURE_COLUMNS)
+DATA_FILE_15M_RAW = os.path.join(BASE_DATA_DIR, "aligned_15m.parquet")  # for raw 'close' prices
+OUTPUT_FEATURES_PATH = os.path.join(TRAIN30_DIR, "forecast_features.parquet")
 
 os.makedirs(MODEL_DIR, exist_ok=True)
+os.makedirs(TRAIN30_DIR, exist_ok=True)
 
 # --- 1. Dataset ---
 
@@ -56,7 +59,7 @@ class ForecastDataset(Dataset):
     def __init__(self, df, lookback=LOOKBACK, forecast_horizon=FORECAST_HORIZON, mode='train', feature_cols=None):
         """
         df: DataFrame indexed by UTC timestamps. Must contain:
-            - core feature columns (scaled; see feature_engine.FEATURE_COLUMNS)
+            - core feature columns (scaled; see feature_engine_train30.FEATURE_COLUMNS_TRAIN30)
             - 'close' column (raw close prices)
         mode: 'train', 'val', 'test', 'inference'
         feature_cols: explicit list of the feature columns (recommended)
@@ -271,7 +274,7 @@ def _ensure_datetime_index(df: pd.DataFrame, *, time_col_candidates: List[str]) 
 
 def load_data() -> pd.DataFrame:
     if not os.path.exists(DATA_FILE_FEATURES):
-        raise FileNotFoundError(f"{DATA_FILE_FEATURES} not found. Run feature_engine.py build first.")
+        raise FileNotFoundError(f"{DATA_FILE_FEATURES} not found. Run feature_engine_train30.py build first (train30 artifacts).")
     if not os.path.exists(DATA_FILE_15M_RAW):
         raise FileNotFoundError(f"{DATA_FILE_15M_RAW} not found. Run build_dataset.py first.")
 

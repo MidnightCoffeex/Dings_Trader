@@ -76,14 +76,57 @@ def prepare_candles(df: pd.DataFrame) -> pd.DataFrame:
 def prepare_funding(df: pd.DataFrame) -> pd.DataFrame:
     """Prepare funding records.
 
-    Expected columns: time_ms, funding_rate
-    Returns DataFrame indexed by UTC time.
+    Supported input schemas (we see both in the wild):
+
+    1) Contract schema (preferred): columns `time_ms`, `funding_rate`
+    2) Binance export schema: index `fundingTime` (datetime) + column `fundingRate`
+       (sometimes also `symbol`, `markPrice`)
+
+    Returns a DataFrame indexed by UTC time with a single column `funding_rate`.
     """
-    if "time_ms" not in df.columns:
-        raise ValueError("Funding dataframe must contain time_ms")
-    if "funding_rate" not in df.columns:
-        raise ValueError("Funding dataframe must contain funding_rate")
-    return _to_utc_index_from_ms(df, "time_ms")[["funding_rate"]]
+
+    out = df.copy()
+
+    # Case A: contract schema with epoch ms
+    if "time_ms" in out.columns:
+        if "funding_rate" not in out.columns:
+            # common variant naming
+            if "fundingRate" in out.columns:
+                out = out.rename(columns={"fundingRate": "funding_rate"})
+            else:
+                raise ValueError("Funding dataframe must contain funding_rate (or fundingRate)")
+        return _to_utc_index_from_ms(out, "time_ms")[["funding_rate"]]
+
+    # Case B: already indexed by datetime (e.g. fundingTime index)
+    if isinstance(out.index, pd.DatetimeIndex):
+        idx = out.index
+        # Normalize tz to UTC
+        if idx.tz is None:
+            idx = idx.tz_localize("UTC")
+        else:
+            idx = idx.tz_convert("UTC")
+        out.index = idx
+
+        if "funding_rate" not in out.columns:
+            if "fundingRate" in out.columns:
+                out = out.rename(columns={"fundingRate": "funding_rate"})
+            else:
+                raise ValueError("Funding dataframe must contain funding_rate (or fundingRate)")
+
+        return out[["funding_rate"]].sort_index()
+
+    # Case C: fundingTime column as datetime
+    if "fundingTime" in out.columns:
+        out = out.rename(columns={"fundingRate": "funding_rate"}) if "fundingRate" in out.columns and "funding_rate" not in out.columns else out
+        if "funding_rate" not in out.columns:
+            raise ValueError("Funding dataframe must contain funding_rate (or fundingRate)")
+        out["time"] = pd.to_datetime(out["fundingTime"], utc=True, errors="coerce")
+        if out["time"].isna().any():
+            raise ValueError("Funding dataframe contains unparsable fundingTime values")
+        out = out.set_index("time").sort_index()
+        return out[["funding_rate"]]
+
+    raise ValueError("Funding dataframe must contain time_ms or be indexed by datetime (fundingTime).")
 
 def make_strict_grid(start: pd.Timestamp, end: pd.Timestamp, freq: str) -> pd.DatetimeIndex:
     """Create a strict UTC DatetimeIndex [start, end] with given frequency."""

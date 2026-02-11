@@ -2,7 +2,7 @@
 
 Schritt 5 — Feature Engine
 
-- Berechnet den *fixen* Core-Feature-Vektor (aktuell 31D) (Reihenfolge gemäß TRAINING_ROADMAP.md)
+- Berechnet den *fixen* Core-Feature-Vektor (aktuell 28D; live/inference-kompatibel)
 - Fit StandardScaler nur auf Train (2019–2023) und speichert ihn als scaler.pkl
 - Wendet Scaler identisch auf Val/Test/Live an (nie live fitten)
 - Schreibt Output: data_processed/features.parquet
@@ -62,14 +62,11 @@ FEATURE_COLUMNS: List[str] = [
     # E) Volume
     "vol_log",
     "vol_z_96",
-    # F) Time (UTC, cyclic) + Sessions
+    # F) Time (UTC, cyclic)
     "hour_sin",
     "hour_cos",
     "dow_sin",
     "dow_cos",
-    "session_asia",
-    "session_europe",
-    "session_us",
     # G) Funding
     "funding_rate_now",
     "time_to_next_funding_steps",
@@ -335,17 +332,8 @@ def compute_core_features(buf_15m: pd.DataFrame, funding_df: Optional[pd.DataFra
     out["dow_sin"] = np.sin(2 * np.pi * dows / 7.0)
     out["dow_cos"] = np.cos(2 * np.pi * dows / 7.0)
 
-    # Session flags (deterministic from UTC hour; overlapping by design)
-    # Asia:   00:00–08:59 UTC
-    # Europe: 07:00–15:59 UTC
-    # US:     13:00–21:59 UTC
-    out["session_asia"] = ((hours >= 0) & (hours < 9)).astype(float)
-    out["session_europe"] = ((hours >= 7) & (hours < 16)).astype(float)
-    out["session_us"] = ((hours >= 13) & (hours < 22)).astype(float)
-
-    # Week-of-year is intentionally NOT used in v1 core features.
-    # Rationale: it tends to overfit holiday/regime artifacts and is unstable across years (52/53 weeks).
-    # If we want it later, we add it explicitly + validate via walk-forward.
+    # Note: Session flags / additional calendar features are intentionally *not* part of the
+    # live core feature vector (28D). Training experiments may add them in separate pipelines.
 
     # G) Funding
     out["funding_rate_now"] = df["funding_rate"].astype(float)

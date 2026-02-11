@@ -60,8 +60,8 @@ def main() -> None:
     feats = compute_core_features(candles, None)
     assert feats.shape[1] == len(FEATURE_COLUMNS)
 
-    # Smoke checks: required time/seasonality columns present
-    required = {"hour_sin", "hour_cos", "dow_sin", "dow_cos", "session_asia", "session_europe", "session_us"}
+    # Smoke checks: required time columns present
+    required = {"hour_sin", "hour_cos", "dow_sin", "dow_cos"}
     missing = required.difference(FEATURE_COLUMNS)
     assert not missing, f"Missing expected time columns in FEATURE_COLUMNS: {sorted(missing)}"
 
@@ -69,10 +69,6 @@ def main() -> None:
     for c in ["hour_sin", "hour_cos", "dow_sin", "dow_cos"]:
         s = feats[c].dropna()
         assert (s.abs() <= 1.0000001).all(), f"{c} out of [-1,1] range"
-
-    for c in ["session_asia", "session_europe", "session_us"]:
-        s = feats[c].dropna().unique()
-        assert set(s).issubset({0.0, 1.0}), f"{c} contains non-binary values: {s}"
 
     print(f"✅ parity ok; {len(FEATURE_COLUMNS)} features")
 

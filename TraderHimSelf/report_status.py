@@ -52,9 +52,6 @@ except Exception:
         "hour_cos",
         "dow_sin",
         "dow_cos",
-        "session_asia",
-        "session_europe",
-        "session_us",
         "funding_rate_now",
         "time_to_next_funding_steps",
     ]

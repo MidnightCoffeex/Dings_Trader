@@ -36,10 +36,12 @@ project_root = os.path.dirname(current_dir)
 sys.path.append(project_root)
 
 from env.perp_env import PerpEnv
-from feature_engine import FEATURE_COLUMNS as CORE_FEATURE_COLUMNS
+from gymnasium import spaces
+from feature_engine_train30 import FEATURE_COLUMNS_TRAIN30 as CORE_FEATURE_COLUMNS
 
 # --- CONFIG ---
-DATA_DIR = os.path.join(project_root, "data_processed")
+BASE_DATA_DIR = os.path.join(project_root, "data_processed")
+TRAIN30_DIR = os.path.join(BASE_DATA_DIR, "train30")  # separate training artifacts; live stays untouched
 MODELS_DIR = os.path.join(project_root, "models")
 LOG_DIR = os.path.join(project_root, "runs/ppo_logs")
 CHECKPOINT_DIR = os.path.join(project_root, "checkpoints/ppo")
@@ -65,8 +67,13 @@ class TrainingPerpEnv(PerpEnv):
         assert len(self.feature_cols) == (CORE_DIM + FORECAST_DIM), \
             f"Expected {CORE_DIM + FORECAST_DIM} feature columns, got {len(self.feature_cols)}"
             
-        # Ensure Observation Space matches (PerpEnv sets it based on dims)
-        self.observation_space = self.observation_space
+        # Override observation space to match our training feature-set (may differ from live env constants).
+        self.observation_space = spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(OS_OBS_DIM,),
+            dtype=np.float32,
+        )
 
     def _get_obs(self):
         """
@@ -153,28 +160,28 @@ def load_data(*, allow_dummy_forecast: bool = False):
     print("Lade Daten...")
     
     # 1. Candles 15m
-    p_15m = os.path.join(DATA_DIR, "aligned_15m.parquet")
+    p_15m = os.path.join(BASE_DATA_DIR, "aligned_15m.parquet")
     if not os.path.exists(p_15m):
         raise FileNotFoundError(f"{p_15m} nicht gefunden. Bitte erst build_dataset.py ausführen.")
     df_15m = pd.read_parquet(p_15m)
     
     # 2. Candles 3m
-    p_3m = os.path.join(DATA_DIR, "aligned_3m.parquet")
+    p_3m = os.path.join(BASE_DATA_DIR, "aligned_3m.parquet")
     if not os.path.exists(p_3m):
         raise FileNotFoundError(f"{p_3m} nicht gefunden.")
     df_3m = pd.read_parquet(p_3m)
     
     # 3. Core Features
-    p_feat = os.path.join(DATA_DIR, "features.parquet")
+    p_feat = os.path.join(TRAIN30_DIR, "features.parquet")
     if not os.path.exists(p_feat):
-        raise FileNotFoundError(f"{p_feat} nicht gefunden. Bitte feature_engine.py ausführen.")
+        raise FileNotFoundError(f"{p_feat} nicht gefunden. Bitte feature_engine_train30.py build ausführen (train30 artifacts).")
     df_feat = pd.read_parquet(p_feat)
     missing_core = [c for c in CORE_FEATURE_COLUMNS if c not in df_feat.columns]
     if missing_core:
         raise ValueError(f"features.parquet missing core columns: {missing_core}")
     
     # 4. Forecast Features
-    p_forecast = os.path.join(DATA_DIR, "forecast_features.parquet")
+    p_forecast = os.path.join(TRAIN30_DIR, "forecast_features.parquet")
     if not os.path.exists(p_forecast):
         if allow_dummy_forecast:
             print(f"WARNUNG: {p_forecast} nicht gefunden. Dummy-Forecast-Features werden erstellt.")
@@ -326,6 +333,7 @@ def main():
     os.makedirs(MODELS_DIR, exist_ok=True)
     os.makedirs(LOG_DIR, exist_ok=True)
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    os.makedirs(TRAIN30_DIR, exist_ok=True)
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--allow-dummy-forecast", action="store_true", help="Use zero forecast features if missing.")
