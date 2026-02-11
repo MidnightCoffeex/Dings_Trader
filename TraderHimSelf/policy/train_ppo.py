@@ -123,6 +123,28 @@ def _rename_fc_feat_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns=renamed)
 
 
+def _slot15m_to_ms(series: pd.Series) -> pd.Series:
+    """Normalize slot_15m values to int64 millisecond timestamps."""
+    s = series.copy()
+
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return (s.astype("int64") // 10**6).astype("int64")
+
+    if pd.api.types.is_numeric_dtype(s):
+        s_num = pd.to_numeric(s, errors="coerce")
+        # Heuristic: nanosecond epochs are much larger than ms epochs.
+        if s_num.dropna().median() > 10**14:
+            s_num = s_num // 10**6
+        return s_num.astype("int64")
+
+    # Fallback: parse strings/objects as datetime
+    s_dt = pd.to_datetime(s, utc=True, errors="coerce")
+    if s_dt.isna().any():
+        bad = int(s_dt.isna().sum())
+        raise ValueError(f"slot_15m contains {bad} unparsable values")
+    return (s_dt.astype("int64") // 10**6).astype("int64")
+
+
 def load_data(*, allow_dummy_forecast: bool = False):
     """Lädt und mergt alle benötigten Daten."""
     print("Lade Daten...")
@@ -195,8 +217,19 @@ def load_data(*, allow_dummy_forecast: bool = False):
         raise ValueError("aligned_3m.parquet missing required column: slot_15m")
     if "open_time_ms" not in df_15m.columns:
         raise ValueError("aligned_15m.parquet missing required column: open_time_ms")
-    valid_slots = set(df_15m["open_time_ms"].values)
+
+    # Normalize slot_15m to ms so it matches 15m open_time_ms domain.
+    df_3m = df_3m.copy()
+    df_3m["slot_15m"] = _slot15m_to_ms(df_3m["slot_15m"])
+
+    valid_slots = set(pd.to_numeric(df_15m["open_time_ms"], errors="coerce").astype("int64").values)
     df_3m = df_3m[df_3m["slot_15m"].isin(valid_slots)].copy()
+
+    if len(df_3m) == 0:
+        raise ValueError(
+            "No aligned 3m rows after slot matching. "
+            "Likely slot_15m/open_time_ms mismatch; rerun build_dataset.py and verify slot units."
+        )
 
     print(f"Daten geladen: {len(df_15m)} 15m Steps, {len(df_3m)} 3m Steps.")
     return df_15m, df_3m
