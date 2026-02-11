@@ -21,36 +21,43 @@ LOOKBACK = 512
 FORECAST_HORIZON = 192
 EXPECTED_MIN_ROWS = LOOKBACK + FORECAST_HORIZON + 1
 
-CORE_FEATURE_COLUMNS = [
-    "ret_1",
-    "ret_4",
-    "ret_16",
-    "ret_48",
-    "hl_range_pct",
-    "oc_range_pct",
-    "vol_16",
-    "vol_96",
-    "vol_672",
-    "atr_14",
-    "ema_20_dist",
-    "ema_50_dist",
-    "ema_200_dist",
-    "ema_20_slope",
-    "ema_50_slope",
-    "adx_14",
-    "rsi_14",
-    "macd",
-    "macd_signal",
-    "macd_hist",
-    "vol_log",
-    "vol_z_96",
-    "hour_sin",
-    "hour_cos",
-    "dow_sin",
-    "dow_cos",
-    "funding_rate_now",
-    "time_to_next_funding_steps",
-]
+# Keep this in sync with feature_engine.FEATURE_COLUMNS (single source of truth).
+try:
+    from feature_engine import FEATURE_COLUMNS as CORE_FEATURE_COLUMNS  # type: ignore
+except Exception:
+    CORE_FEATURE_COLUMNS = [
+        "ret_1",
+        "ret_4",
+        "ret_16",
+        "ret_48",
+        "hl_range_pct",
+        "oc_range_pct",
+        "vol_16",
+        "vol_96",
+        "vol_672",
+        "atr_14",
+        "ema_20_dist",
+        "ema_50_dist",
+        "ema_200_dist",
+        "ema_20_slope",
+        "ema_50_slope",
+        "adx_14",
+        "rsi_14",
+        "macd",
+        "macd_signal",
+        "macd_hist",
+        "vol_log",
+        "vol_z_96",
+        "hour_sin",
+        "hour_cos",
+        "dow_sin",
+        "dow_cos",
+        "session_asia",
+        "session_europe",
+        "session_us",
+        "funding_rate_now",
+        "time_to_next_funding_steps",
+    ]
 FORECAST_COLUMNS = [f"forecast_{i}" for i in range(35)]
 
 

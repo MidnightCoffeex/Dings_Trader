@@ -2,7 +2,7 @@
 
 Schritt 5 — Feature Engine
 
-- Berechnet den *fixen* Core-Feature-Vektor (aktuell 33D) (Reihenfolge gemäß TRAINING_ROADMAP.md)
+- Berechnet den *fixen* Core-Feature-Vektor (aktuell 31D) (Reihenfolge gemäß TRAINING_ROADMAP.md)
 - Fit StandardScaler nur auf Train (2019–2023) und speichert ihn als scaler.pkl
 - Wendet Scaler identisch auf Val/Test/Live an (nie live fitten)
 - Schreibt Output: data_processed/features.parquet
@@ -62,11 +62,14 @@ FEATURE_COLUMNS: List[str] = [
     # E) Volume
     "vol_log",
     "vol_z_96",
-    # F) Time (UTC, cyclic)
+    # F) Time (UTC, cyclic) + Sessions
     "hour_sin",
     "hour_cos",
     "dow_sin",
     "dow_cos",
+    "session_asia",
+    "session_europe",
+    "session_us",
     # G) Funding
     "funding_rate_now",
     "time_to_next_funding_steps",
@@ -320,8 +323,11 @@ def compute_core_features(buf_15m: pd.DataFrame, funding_df: Optional[pd.DataFra
     # F) Time (UTC)
     # NOTE: These features use only the candle timestamp (no future data) => no leakage.
     ts = out.index
-    hours = ts.hour  # 0..23 (UTC)
-    dows = ts.dayofweek  # 0..6 (Mon..Sun)
+    # Always compute time features in UTC (even if input index is tz-aware in another zone).
+    # If index is tz-naive, we interpret it as UTC.
+    ts_utc = ts.tz_localize("UTC") if ts.tz is None else ts.tz_convert("UTC")
+    hours = ts_utc.hour  # 0..23 (UTC)
+    dows = ts_utc.dayofweek  # 0..6 (Mon..Sun)
 
     # Cyclic encodings
     out["hour_sin"] = np.sin(2 * np.pi * hours / 24.0)
@@ -337,11 +343,9 @@ def compute_core_features(buf_15m: pd.DataFrame, funding_df: Optional[pd.DataFra
     out["session_europe"] = ((hours >= 7) & (hours < 16)).astype(float)
     out["session_us"] = ((hours >= 13) & (hours < 22)).astype(float)
 
-    # Week-of-year seasonality (ISO week). Encode cyclic to avoid discontinuity at year boundaries.
-    # ISO week can be 53 for some years; we wrap it into 0..51 for stable 52-week cyclic encoding.
-    woy = (ts.isocalendar().week.astype(int) - 1) % 52
-    out["woy_sin"] = np.sin(2 * np.pi * woy / 52.0)
-    out["woy_cos"] = np.cos(2 * np.pi * woy / 52.0)
+    # Week-of-year is intentionally NOT used in v1 core features.
+    # Rationale: it tends to overfit holiday/regime artifacts and is unstable across years (52/53 weeks).
+    # If we want it later, we add it explicitly + validate via walk-forward.
 
     # G) Funding
     out["funding_rate_now"] = df["funding_rate"].astype(float)
@@ -351,7 +355,7 @@ def compute_core_features(buf_15m: pd.DataFrame, funding_df: Optional[pd.DataFra
     cycle = cfg.funding_cycle_hours
     steps_total = int((cycle * 60) / 15)
     hour_mod = (hours % cycle).astype(int)
-    minute_steps = (ts.minute // 15).astype(int)
+    minute_steps = (ts_utc.minute // 15).astype(int)
     steps_in_cycle = hour_mod * 4 + minute_steps
     steps_left = pd.Series(steps_total - steps_in_cycle, index=out.index).clip(lower=0, upper=steps_total)
     out["time_to_next_funding_steps"] = steps_left.astype(float)

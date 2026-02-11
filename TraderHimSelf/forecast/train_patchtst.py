@@ -72,7 +72,7 @@ class ForecastDataset(Dataset):
         if feature_cols is not None:
             self.feature_cols = list(feature_cols)
         else:
-            # Fallback: assume the first 28 columns are features
+            # Fallback: assume the first INPUT_CHANNELS columns are features
             self.feature_cols = list(df.columns[:INPUT_CHANNELS])
         
         # We need 'close' for target calculation if not in features (it usually isn't raw close)

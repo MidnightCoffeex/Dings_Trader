@@ -71,7 +71,7 @@ class TrainingPerpEnv(PerpEnv):
     def _get_obs(self):
         """
         Holt den Observation Vector für den aktuellen Step.
-        Aufbau: [Core Features (28) | Forecast Features (35) | Account State (9)]
+        Aufbau: [Core Features (CORE_DIM) | Forecast Features (35) | Account State (9)]
         """
         # 1. ML Features aus DataFrame holen
         if not hasattr(self, 'features_np'):

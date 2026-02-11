@@ -282,17 +282,22 @@ Checks:
 21. vol_log  = log(1 + volume)
 22. vol_z_96 = zscore(vol_log, 96)
 
-#### F) Zeit-Features
+#### F) Zeit-Features (UTC, cyclic) + Session-Flags
 23. hour_sin
 24. hour_cos
 25. dow_sin
 26. dow_cos
+27. session_asia   (UTC hour ∈ [00, 09))
+28. session_europe (UTC hour ∈ [07, 16))
+29. session_us     (UTC hour ∈ [13, 22))
 
 #### G) Funding Features
-27. funding_rate_now
-28. time_to_next_funding_steps (in 15m steps, capped 0..32)
+30. funding_rate_now
+31. time_to_next_funding_steps (in 15m steps, capped 0..32)
 
-Core Features Dimension: 28
+Core Features Dimension: 31
+
+**Hinweis (bewusst nicht übernommen):** `week_of_year` / woy_sin/cos ist in v1 *nicht* Teil der Core-Features, um Holiday-/Regime-Overfitting zu vermeiden und weil die ISO-Woche (52/53) zusätzliche Edge-Cases erzeugt. Falls wir es später hinzufügen: nur mit Walk-Forward Nachweis.
 
 ### 5.2 Normalisierung (fest)
 - Fit StandardScaler nur auf Train (2019–2023)
@@ -392,7 +397,7 @@ File: forecast/train_patchtst.py
 ### 8.1 Input
 ✅ **Implementiert:** `TraderHimSelf/forecast/train_patchtst.py`
 - Lookback = 512
-- Input channels: 28 Core Features (normalisiert)
+- Input channels: 31 Core Features (normalisiert)
 
 ### 8.2 Targets (multi-horizon)
 ✅ **Implementiert** (q10, q50, q90 für 1h, 4h, 12h, 24h, 48h)
@@ -542,11 +547,11 @@ Dann:
 
 ## Was du JETZT programmieren lässt (exakte Reihenfolge)
 1) build_dataset.py (15m+3m, Alignment, Funding Schema)
-2) feature_engine.py (28 Core Features + scaler + Parity Test)
+2) feature_engine.py (31 Core Features + scaler + Parity Test)
 3) perp_env.py (15m decision + 3m intrabar + SL-first + Multi-positions bis 10)
 4) risk_manager.py (Exposure cap + max 10 positions + no-hedge + entry penalty)
 5) PatchTST training + forecast precompute (35 Features + Pinball Loss)
-6) PPO training (Obs dim 72, reward shaping inkl. entry penalty)
+6) PPO training (Obs dim 75, reward shaping inkl. entry penalty)
 7) Evaluation (walk-forward + baseline)
 8) bootstrapping + gap handling
 9) shadow live
