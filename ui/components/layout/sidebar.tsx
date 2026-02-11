@@ -18,6 +18,7 @@ import { Separator } from "@/components/ui/separator";
 
 const nav = [
   { href: "/dashboard", label: "Dashboard", icon: Activity },
+  { href: "/capacity", label: "Kapazität", icon: BarChart3 },
 ];
 
 export function Sidebar({

@@ -19,6 +19,18 @@ from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 import math
 
+# Observation dimension helpers
+# Keep in sync with feature_engine.FEATURE_COLUMNS and train_ppo.py
+try:
+    from feature_engine import FEATURE_COLUMNS as CORE_FEATURE_COLUMNS  # type: ignore
+    CORE_DIM = len(CORE_FEATURE_COLUMNS)
+except Exception:
+    CORE_DIM = 28
+
+FORECAST_DIM = 35
+ACCOUNT_DIM = 9
+OS_OBS_DIM = CORE_DIM + FORECAST_DIM + ACCOUNT_DIM
+
 # Versuche data_contract zu importieren, fallback falls Pfad nicht stimmt
 try:
     from ..data_contract import TradingConfig, CandleRecord
@@ -148,9 +160,9 @@ class PerpEnv(gym.Env):
         
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(5,), dtype=np.float32)
 
-        # Observation Space (Step 9.1): 72 Dimensionen
-        # Wir nehmen an, die Input DFs haben die Features schon oder wir füllen Nullen.
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(72,), dtype=np.float32)
+        # Observation Space: CORE_DIM + FORECAST_DIM + ACCOUNT_DIM
+        # (Core dims derived from feature_engine.FEATURE_COLUMNS when available.)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(OS_OBS_DIM,), dtype=np.float32)
 
         # State Variables
         self.current_step = 0
@@ -540,7 +552,7 @@ class PerpEnv(gym.Env):
         # 1. Features & Forecast (aus DataFrame)
         # Wir nehmen an, der DF hat Spalten 'feat_0'...'feat_62' oder wir füllen 0
         # Hier returnen wir Nullen für den ML-Part, da feature_engine nicht integriert ist
-        ml_features = np.zeros(28 + 35, dtype=np.float32)
+        ml_features = np.zeros(CORE_DIM + FORECAST_DIM, dtype=np.float32)
         
         # 2. Portfolio State (9 Dim)
         # pos_count, pos_side_major, exposure_open_pct, notional_open_pct, uPnL_open_pct,

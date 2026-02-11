@@ -15,6 +15,7 @@ interface SignalData {
     long: number;
   };
   timestamp?: string;
+  action_raw?: number[];
 }
 
 interface PaperDashboardData {
@@ -25,6 +26,47 @@ interface TradingSignalsTileProps {
   modelId: string;
   initialSignal?: SignalData;
   symbol?: string;
+}
+
+function SignalGauge({ value }: { value: number }) {
+  // value is -1.0 to 1.0
+  // Map to percentage 0 to 100
+  const percentage = Math.min(Math.max(((value + 1) / 2) * 100, 0), 100);
+  
+  // Color determination
+  let colorClass = "bg-slate-400";
+  if (value >= 0.1) colorClass = "bg-emerald-500";
+  else if (value <= -0.1) colorClass = "bg-rose-500";
+  
+  return (
+    <div className="w-full flex flex-col gap-1.5 pt-2">
+      <div className="flex justify-between text-[9px] text-muted-foreground px-0.5 uppercase tracking-wider font-semibold">
+        <span>Short</span>
+        <span>Flat</span>
+        <span>Long</span>
+      </div>
+      <div className="relative h-2.5 w-full bg-secondary/50 rounded-full overflow-hidden border border-border/50">
+        {/* Center marker */}
+        <div className="absolute top-0 bottom-0 left-1/2 w-px bg-foreground/20 -translate-x-1/2 z-10" />
+        
+        {/* Bar from Center */}
+        <div 
+          className={`absolute top-0 bottom-0 transition-all duration-500 ${colorClass}`}
+          style={{ 
+            left: value < 0 ? `${percentage}%` : '50%',
+            right: value > 0 ? `${100 - percentage}%` : '50%',
+            opacity: 0.9
+          }}
+        />
+      </div>
+      <div className="flex justify-between items-center mt-0.5">
+        <span className="text-[10px] text-muted-foreground">Decision Strength</span>
+        <span className={`text-xs font-mono font-medium ${value >= 0.1 ? "text-emerald-400" : value <= -0.1 ? "text-rose-400" : "text-muted-foreground"}`}>
+          {value > 0 ? "+" : ""}{value.toFixed(2)}
+        </span>
+      </div>
+    </div>
+  );
 }
 
 export function TradingSignalsTile({ 
@@ -66,15 +108,15 @@ export function TradingSignalsTile({
     }
   }, [modelId]);
 
-  // Auto-refresh every 2 seconds for real-time feel
+  // Auto-refresh (reduced polling pressure)
   useEffect(() => {
     // Initial fetch
     fetchSignal();
-    
-    // Set up interval
+
+    const REFRESH_MS = 15000;
     const interval = setInterval(() => {
       fetchSignal();
-    }, 2000); // 2 seconds
+    }, REFRESH_MS);
 
     return () => clearInterval(interval);
   }, [fetchSignal]);
@@ -94,12 +136,16 @@ export function TradingSignalsTile({
         </div>
       </div>
       
-      <div className="flex items-center justify-between rounded-lg border border-border/70 bg-background/40 px-3 py-2.5 shadow-sm">
-        <div className="text-sm font-medium">{symbol}</div>
-        <div className="flex items-center gap-2">
+      <div className="flex flex-col gap-2 rounded-lg border border-border/70 bg-background/40 px-3 py-3 shadow-sm">
+        <div className="flex items-center justify-between">
+          <div className="text-sm font-medium">{symbol}</div>
           <Badge variant="purple">{signal?.signal || "FLAT"}</Badge>
-          <Badge variant="outline">{signal?.confidence || 0}% Confidence</Badge>
         </div>
+        
+        <SignalGauge value={signal?.action_raw?.[0] ?? (
+          signal?.signal === "LONG" ? (signal?.confidence || 0) / 100 :
+          signal?.signal === "SHORT" ? -(signal?.confidence || 0) / 100 : 0
+        )} />
       </div>
       
       <div className="flex items-center justify-between text-[10px] text-muted-foreground">

@@ -8,8 +8,12 @@ from typing import Optional, List
 from datetime import datetime
 import os
 import sys
+import requests
 
 from paper_trading import get_paper_engine, PaperTradingEngine
+
+# Model package registry
+from db import get_model_package
 
 # Try import new inference module
 try:
@@ -19,6 +23,16 @@ except ImportError:
     from ppo_forecast_inference import get_inference
 
 router = APIRouter(prefix="/paper", tags=["paper-trading"])
+
+
+def _resolve_model_package_id(model_id: str) -> str:
+    """Map paper trading account model_id to model package id.
+
+    UI convention: modelId = <package_id>, paperModelId = paper_<package_id>
+    """
+    if model_id.startswith("paper_"):
+        return model_id[len("paper_") :]
+    return model_id
 
 
 class CreateAccountRequest(BaseModel):
@@ -93,10 +107,24 @@ async def get_account(model_id: str):
     account = engine.get_account(model_id)
     
     if not account:
-        raise HTTPException(status_code=404, detail="Account not found")
-    
+        # Auto-create account with defaults (so UI timers can work immediately)
+        account = engine.create_account(
+            model_id=model_id,
+            initial_balance=10000.0,
+            max_positions=5,
+            default_leverage=7.0,
+            profit_target_pct=5.0,
+            time_limit_hours=48.0,
+        )
+
+    package_id = _resolve_model_package_id(model_id)
+    pkg = get_model_package(package_id) if package_id else None
+
     return {
         "model_id": account.model_id,
+        "model_package_id": package_id,
+        "warmup_required": bool(pkg and int(pkg.get("warmup_required", 0)) == 1),
+        "warmup_status": (pkg or {}).get("warmup_status"),
         "balance_usdt": account.balance_usdt,
         "total_equity": account.total_equity,
         "initial_balance": account.initial_balance,
@@ -295,7 +323,17 @@ async def process_signal(req: SignalRequest):
                 })
                 result["actions"].append(f"Closed {pos.side} position due to signal flip")
     
-    # 3. Open new position if signal is strong
+    # 3. Block auto-trading until model package warmup is completed
+    package_id = _resolve_model_package_id(req.model_id)
+    pkg = get_model_package(package_id) if package_id else None
+    if pkg and int(pkg.get("warmup_required", 0)) == 1 and pkg.get("warmup_status") != "DONE":
+        result["actions"].append(
+            f"Warmup pending for model package '{package_id}' (status={pkg.get('warmup_status')}). Trading is paused until first successful ML inference."
+        )
+        result["current_stats"] = engine.get_performance_stats(req.model_id)
+        return result
+
+    # 4. Open new position if signal is strong
     if req.confidence >= 60 and req.signal in ["LONG", "SHORT"]:
         # Allow multiple positions up to max_positions if total exposure < 10%
         open_positions = engine.get_open_positions(req.model_id)
@@ -348,8 +386,9 @@ async def process_signal(req: SignalRequest):
 async def get_ml_signal(model_id: str, symbol: str = "BTCUSDT"):
     """Holt aktuelles ML-Signal mit Confidence (PPO+Forecast)."""
     try:
-        # Use new PPO Forecast Inference
-        inf = get_inference()
+        # Use PPO Forecast Inference (per model package)
+        package_id = _resolve_model_package_id(model_id)
+        inf = get_inference(model_package_id=package_id)
         result = inf.predict(symbol=symbol)
         
         if "error" in result:
@@ -360,6 +399,8 @@ async def get_ml_signal(model_id: str, symbol: str = "BTCUSDT"):
         confidence = result.get("confidence", 0)
         sentiment = result.get("sentiment", "neutral")
         current_price = result.get("current_price", 0.0)
+        action_raw = result.get("action_raw", [])
+        forecast_values = result.get("forecast_values", [])
         
         # Probabilities are fake/synthetic for UI compat
         probs = {
@@ -376,10 +417,37 @@ async def get_ml_signal(model_id: str, symbol: str = "BTCUSDT"):
             "sentiment": sentiment,
             "current_price": current_price,
             "probabilities": probs,
+            "action_raw": action_raw,
+            "forecast_values": forecast_values,
             "timestamp": datetime.utcnow().isoformat() + 'Z',
             "diagnostics": result.get("diagnostics", {})
         }
     
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
+
+
+@router.get("/ml-signal-lite/{model_id}")
+async def get_ml_signal_lite(model_id: str, symbol: str = "BTCUSDT"):
+    """Lite Signal: ohne Forecast-Payload (für schnelle UI-Updates)."""
+    try:
+        package_id = _resolve_model_package_id(model_id)
+        inf = get_inference(model_package_id=package_id)
+        result = inf.predict(symbol=symbol)
+        
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
+        
+        return {
+            "model_id": model_id,
+            "symbol": symbol,
+            "signal": result.get("signal", "FLAT"),
+            "confidence": result.get("confidence", 0),
+            "sentiment": result.get("sentiment", "neutral"),
+            "current_price": result.get("current_price", 0.0),
+            "action_raw": result.get("action_raw", []),
+            "timestamp": datetime.utcnow().isoformat() + 'Z'
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
 
@@ -404,7 +472,8 @@ async def get_dashboard_data(model_id: str):
     
     # Get ML signal (PPO+Forecast)
     try:
-        inf = get_inference()
+        package_id = _resolve_model_package_id(model_id)
+        inf = get_inference(model_package_id=package_id)
         res = inf.predict(symbol="BTCUSDT")
         
         if "error" in res:
@@ -415,6 +484,8 @@ async def get_dashboard_data(model_id: str):
                 "confidence": res.get("confidence", 0), 
                 "sentiment": res.get("sentiment", "neutral"),
                 "current_price": res.get("current_price", 0.0),
+                "action_raw": res.get("action_raw", []),
+                "forecast_values": res.get("forecast_values", []),
                 "diagnostics": res.get("diagnostics", {})
             }
     except Exception as e:
@@ -460,9 +531,15 @@ async def get_dashboard_data(model_id: str):
         for p in closed_positions
     ]
     
+    package_id = _resolve_model_package_id(model_id)
+    pkg = get_model_package(package_id) if package_id else None
+
     return {
         "account": {
             "model_id": account.model_id,
+            "model_package_id": package_id,
+            "warmup_required": bool(pkg and int(pkg.get("warmup_required", 0)) == 1),
+            "warmup_status": (pkg or {}).get("warmup_status"),
             "initial_balance": account.initial_balance,
             "balance_usdt": account.balance_usdt,
             "total_equity": account.total_equity,
@@ -488,6 +565,35 @@ async def get_dashboard_data(model_id: str):
             "open_exposure_pct": stats.get("open_exposure_pct", 0)
         }
     }
+
+
+@router.get("/market-data/candles")
+async def get_candles(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 100):
+    """Holt Candles von Binance für Charts."""
+    base_url = "https://api.binance.com/api/v3/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    
+    try:
+        r = requests.get(base_url, params=params, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        
+        # Format: [time, open, high, low, close, ...]
+        candles = []
+        for c in data:
+            candles.append({
+                "time": c[0], # ms timestamp
+                "open": float(c[1]),
+                "high": float(c[2]),
+                "low": float(c[3]),
+                "close": float(c[4]),
+                "volume": float(c[5])
+            })
+            
+        return {"symbol": symbol, "interval": interval, "candles": candles}
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Binance API error: {str(e)}")
 
 
 if __name__ == "__main__":

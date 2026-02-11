@@ -64,7 +64,7 @@ export function LegacyTradeHistory({
   const [recentTrades, setRecentTrades] = useState<PaperTrade[]>(initialTrades);
   const [error, setError] = useState<string | null>(null);
 
-  // Polling function to fetch data every 2 seconds
+  // Polling function (reduced pressure on /api/paper/dashboard)
   const fetchData = useCallback(async () => {
     try {
       const res = await fetch(`/api/paper/dashboard/${modelId}`, {
@@ -91,8 +91,8 @@ export function LegacyTradeHistory({
     // Fetch immediately on mount
     fetchData();
     
-    // Poll every 2 seconds
-    const interval = setInterval(fetchData, 2000);
+    // Poll every 15 seconds
+    const interval = setInterval(fetchData, 15000);
     
     return () => clearInterval(interval);
   }, [fetchData]);

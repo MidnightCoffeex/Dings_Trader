@@ -4,11 +4,9 @@ export const revalidate = 0;
 import { Suspense } from "react";
 import { PageHeader } from "@/components/layout/page-header";
 import { ModelSelector } from "@/components/layout/model-selector";
-import { ChartLoader } from "@/components/layout/chart-loader";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import {
-  LiveTicker,
   ActivePositions,
   ClosedTrades,
   RiskMeter,
@@ -16,6 +14,8 @@ import {
   AccountBalance,
   LegacyTradeHistory,
   TradingSignalsTile,
+  TradingChart,
+  LivePriceBubble,
 } from "@/components/dashboard";
 import { PaperTradingStatus } from "@/components/layout/paper-trading-status";
 
@@ -365,6 +365,7 @@ export default async function DashboardPage(props: {
         status={status}
         isLive={true}
         showLiveTimer={true}
+        modelId={paperModelId}
         actions={
           <Suspense fallback={<div className="w-32 h-10 bg-muted/20 rounded animate-pulse" />}>
             <ModelSelector />
@@ -372,10 +373,13 @@ export default async function DashboardPage(props: {
         }
       />
 
-      {/* Obere Reihe: Live Ticker + Account Balance (with Paper Trading data) */}
+      {/* Obere Reihe: Trading Chart + Account Balance (Forecast + Timeframes sofort sichtbar) */}
       <div className="grid gap-4 lg:grid-cols-3 2xl:gap-6 w-full">
-        <div className="lg:col-span-2 w-full">
-          <LiveTicker symbol="BTC/USDT" />
+        <div className="lg:col-span-2 w-full flex flex-col gap-3">
+          <div className="max-w-[420px]">
+            <LivePriceBubble modelId={paperModelId} symbol="BTCUSDT" />
+          </div>
+          <TradingChart modelId={paperModelId} />
         </div>
         <AccountBalance account={paperData.account} modelId={paperModelId} />
       </div>
@@ -428,11 +432,8 @@ export default async function DashboardPage(props: {
         </div>
       </div>
 
-      {/* Untere Reihe: Equity Chart + Closed Trades (with Paper Trading data) */}
-      <div className="grid gap-4 lg:grid-cols-3 2xl:gap-6 w-full">
-        <div className="lg:col-span-2 w-full">
-          <ChartLoader data={equityData} />
-        </div>
+      {/* Untere Reihe: Closed Trades (with Paper Trading data) */}
+      <div className="w-full">
         <ClosedTrades trades={paperData.recent_trades} />
       </div>
 

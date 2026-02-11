@@ -74,7 +74,7 @@ export function NextSignalPreview({
     }
   }, [modelId]);
 
-  // Auto-refresh every 2 seconds for real-time feel
+  // Auto-refresh (reduced polling pressure)
   useEffect(() => {
     // Initial fetch
     fetchSignal();
@@ -82,7 +82,7 @@ export function NextSignalPreview({
     // Set up interval
     const interval = setInterval(() => {
       fetchSignal();
-    }, 2000); // 2 seconds
+    }, 15000); // 15 seconds
 
     return () => clearInterval(interval);
   }, [fetchSignal]);

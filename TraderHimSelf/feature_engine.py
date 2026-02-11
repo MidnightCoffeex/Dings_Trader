@@ -2,7 +2,7 @@
 
 Schritt 5 — Feature Engine
 
-- Berechnet den *fixen* 28D Core-Feature-Vektor (Reihenfolge gemäß TRAINING_ROADMAP.md)
+- Berechnet den *fixen* Core-Feature-Vektor (aktuell 33D) (Reihenfolge gemäß TRAINING_ROADMAP.md)
 - Fit StandardScaler nur auf Train (2019–2023) und speichert ihn als scaler.pkl
 - Wendet Scaler identisch auf Val/Test/Live an (nie live fitten)
 - Schreibt Output: data_processed/features.parquet
@@ -62,11 +62,16 @@ FEATURE_COLUMNS: List[str] = [
     # E) Volume
     "vol_log",
     "vol_z_96",
-    # F) Time
+    # F) Time (UTC, cyclic + session flags + optional seasonality)
     "hour_sin",
     "hour_cos",
     "dow_sin",
     "dow_cos",
+    "session_asia",
+    "session_europe",
+    "session_us",
+    "woy_sin",
+    "woy_cos",
     # G) Funding
     "funding_rate_now",
     "time_to_next_funding_steps",
@@ -233,7 +238,7 @@ def _merge_funding_asof(candles: pd.DataFrame, funding: pd.DataFrame) -> pd.Data
 
 
 def compute_core_features(buf_15m: pd.DataFrame, funding_df: Optional[pd.DataFrame] = None, *, cfg: FeatureEngineConfig = FeatureEngineConfig()) -> pd.DataFrame:
-    """Compute the 28 core features on a buffer of 15m candles.
+    """Compute the core features (see FEATURE_COLUMNS) on a buffer of 15m candles.
 
     This function is designed to be used *identically* for offline batch computation
     and for live/streaming computation (input = rolling buffer).
@@ -317,14 +322,31 @@ def compute_core_features(buf_15m: pd.DataFrame, funding_df: Optional[pd.DataFra
     out["vol_log"] = np.log1p(df["volume"].clip(lower=0.0))
     out["vol_z_96"] = rolling_zscore(out["vol_log"], 96)
 
-    # F) Time
+    # F) Time (UTC)
+    # NOTE: These features use only the candle timestamp (no future data) => no leakage.
     ts = out.index
-    hours = ts.hour
-    dows = ts.dayofweek
+    hours = ts.hour  # 0..23 (UTC)
+    dows = ts.dayofweek  # 0..6 (Mon..Sun)
+
+    # Cyclic encodings
     out["hour_sin"] = np.sin(2 * np.pi * hours / 24.0)
     out["hour_cos"] = np.cos(2 * np.pi * hours / 24.0)
     out["dow_sin"] = np.sin(2 * np.pi * dows / 7.0)
     out["dow_cos"] = np.cos(2 * np.pi * dows / 7.0)
+
+    # Session flags (deterministic from UTC hour; overlapping by design)
+    # Asia:   00:00–08:59 UTC
+    # Europe: 07:00–15:59 UTC
+    # US:     13:00–21:59 UTC
+    out["session_asia"] = ((hours >= 0) & (hours < 9)).astype(float)
+    out["session_europe"] = ((hours >= 7) & (hours < 16)).astype(float)
+    out["session_us"] = ((hours >= 13) & (hours < 22)).astype(float)
+
+    # Week-of-year seasonality (ISO week). Encode cyclic to avoid discontinuity at year boundaries.
+    # ISO week can be 53 for some years; we wrap it into 0..51 for stable 52-week cyclic encoding.
+    woy = (ts.isocalendar().week.astype(int) - 1) % 52
+    out["woy_sin"] = np.sin(2 * np.pi * woy / 52.0)
+    out["woy_cos"] = np.cos(2 * np.pi * woy / 52.0)
 
     # G) Funding
     out["funding_rate_now"] = df["funding_rate"].astype(float)

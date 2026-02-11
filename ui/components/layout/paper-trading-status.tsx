@@ -6,6 +6,9 @@ import { Loader2 } from "lucide-react";
 
 interface PaperAccount {
   model_id: string;
+  model_package_id?: string;
+  warmup_required?: boolean;
+  warmup_status?: string;
   initial_balance: number;
   balance_usdt: number;
   total_equity: number;
@@ -52,8 +55,8 @@ export function PaperTradingStatus({ modelId, initialData }: PaperTradingStatusP
       }
     };
 
-    // Poll every 2 seconds
-    const interval = setInterval(fetchData, 2000);
+    // Poll every 15 seconds
+    const interval = setInterval(fetchData, 15000);
 
     return () => clearInterval(interval);
   }, [modelId]);
@@ -89,6 +92,14 @@ export function PaperTradingStatus({ modelId, initialData }: PaperTradingStatusP
             <span className="text-muted-foreground">Positionen</span>
             <span className="font-medium">{data.open_positions_count} / {account.max_positions}</span>
           </div>
+          {account.warmup_required ? (
+            <div className="flex items-center justify-between">
+              <span className="text-muted-foreground">Warmup</span>
+              <span className={`font-medium ${account.warmup_status === 'DONE' ? 'text-emerald-400' : 'text-amber-300'}`}>
+                {account.warmup_status || 'PENDING'}
+              </span>
+            </div>
+          ) : null}
           <div className="flex items-center justify-between">
             <span className="text-muted-foreground">Win Rate</span>
             <span className="font-medium">{account.win_rate.toFixed(1)}%</span>

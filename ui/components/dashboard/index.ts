@@ -1,4 +1,5 @@
 export { LiveTicker } from "./live-ticker";
+export { LivePriceBubble } from "./live-price-bubble";
 export { ActivePositions } from "./active-positions";
 export { ClosedTrades } from "./closed-trades";
 export { RiskMeter } from "./risk-meter";
@@ -7,3 +8,4 @@ export { AccountBalance } from "./account-balance";
 export { PaperTradingPanel } from "./paper-trading-panel";
 export { LegacyTradeHistory } from "./legacy-trade-history";
 export { TradingSignalsTile } from "./trading-signals-tile";
+export { TradingChart } from "./trading-chart";
