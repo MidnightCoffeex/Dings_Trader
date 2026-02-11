@@ -547,6 +547,11 @@ def precompute_features(args):
 
     model.eval()
 
+    batch_log_every = int(getattr(args, 'log_every_batches', 0) or 0)
+    total_precompute_batches = len(loader)
+    if total_precompute_batches == 0:
+        raise RuntimeError("No precompute batches produced. Dataset too short or batch size too large.")
+
     all_features = []
 
     with torch.no_grad():
@@ -565,6 +570,18 @@ def precompute_features(args):
             # Compute features for batch (CPU bound)
             batch_feats = [compute_forecast_features(p) for p in preds_np]
             all_features.extend(batch_feats)
+
+            if batch_log_every > 0:
+                should_log = (
+                    (batch_idx + 1) == 1
+                    or ((batch_idx + 1) % batch_log_every == 0)
+                    or ((batch_idx + 1) == total_precompute_batches)
+                )
+                if should_log:
+                    logger.info(
+                        f"Precompute Batch {batch_idx + 1}/{total_precompute_batches} | "
+                        f"Generated feature rows: {len(all_features)}"
+                    )
             
     if len(all_features) == 0:
         features_array = np.empty((0, 35), dtype=np.float32)
