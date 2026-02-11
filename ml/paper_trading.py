@@ -41,6 +41,7 @@ class PaperPosition:
 @dataclass
 class PaperAccount:
     model_id: str
+    model_package_id: str
     balance_usdt: float  # Verfügbares Geld
     total_equity: float  # Balance + offene Positionen
     initial_balance: float
@@ -78,6 +79,7 @@ class PaperTradingEngine:
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS paper_accounts (
                 model_id TEXT PRIMARY KEY,
+                model_package_id TEXT,
                 balance_usdt REAL DEFAULT 10000.0,
                 total_equity REAL DEFAULT 10000.0,
                 initial_balance REAL DEFAULT 10000.0,
@@ -92,6 +94,12 @@ class PaperTradingEngine:
                 time_limit_hours REAL DEFAULT 48.0
             )
         """)
+        
+        # Add model_package_id column if it doesn't exist (migration)
+        try:
+            cursor.execute("SELECT model_package_id FROM paper_accounts LIMIT 1")
+        except sqlite3.OperationalError:
+            cursor.execute("ALTER TABLE paper_accounts ADD COLUMN model_package_id TEXT")
         
         # Add reset_at column if it doesn't exist (migration)
         try:
@@ -195,6 +203,7 @@ class PaperTradingEngine:
     def create_account(
         self, 
         model_id: str, 
+        model_package_id: Optional[str] = None,
         initial_balance: float = 10000.0,
         max_positions: int = 5,
         default_leverage: float = 7.0,
@@ -202,17 +211,24 @@ class PaperTradingEngine:
         time_limit_hours: float = 48.0
     ) -> PaperAccount:
         """Erstellt ein neues Paper-Trading Konto."""
+        # Fallback if package id not provided: slugify from model_id or use ppo_v1
+        if model_package_id is None:
+            if model_id.startswith("paper_"):
+                model_package_id = model_id[6:]
+            else:
+                model_package_id = "ppo_v1"
+
         conn = self._get_conn()
         cursor = conn.cursor()
         
         now = datetime.utcnow()
         cursor.execute("""
             INSERT OR REPLACE INTO paper_accounts 
-            (model_id, balance_usdt, total_equity, initial_balance, created_at, updated_at, reset_at,
+            (model_id, model_package_id, balance_usdt, total_equity, initial_balance, created_at, updated_at, reset_at,
              max_positions, default_leverage, profit_target_pct, time_limit_hours, total_fees_paid)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            model_id, initial_balance, initial_balance, initial_balance, 
+            model_id, model_package_id, initial_balance, initial_balance, initial_balance, 
             now, now, now, max_positions, default_leverage, profit_target_pct, time_limit_hours, 0.0
         ))
         
@@ -254,6 +270,7 @@ class PaperTradingEngine:
         
         return PaperAccount(
             model_id=row["model_id"],
+            model_package_id=row["model_package_id"] or "ppo_v1",
             balance_usdt=row["balance_usdt"],
             total_equity=row["total_equity"],
             initial_balance=row["initial_balance"],

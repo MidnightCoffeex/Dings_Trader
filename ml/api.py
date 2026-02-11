@@ -316,13 +316,6 @@ async def paper_account_root(model_id: str):
     """Alias für /paper/account/{model_id}"""
     from fastapi import HTTPException
     
-    # Only support paper_test_hf model
-    if model_id != "paper_test_hf":
-        raise HTTPException(
-            status_code=403, 
-            detail=f"Model '{model_id}' is not supported. Only 'paper_test_hf' is active."
-        )
-    
     engine = get_paper_engine()
     account = engine.get_account(model_id)
     
@@ -348,15 +341,6 @@ async def paper_account_root(model_id: str):
 async def paper_dashboard_root(model_id: str):
     """Alias für /paper/dashboard/{model_id}"""
     from paper_api import get_dashboard_data
-    from fastapi import HTTPException
-    
-    # Only support paper_test_hf model
-    if model_id != "paper_test_hf":
-        raise HTTPException(
-            status_code=403, 
-            detail=f"Model '{model_id}' is not supported. Only 'paper_test_hf' is active."
-        )
-    
     return await get_dashboard_data(model_id)
 
 @app.post("/paper-signal")
@@ -364,14 +348,6 @@ async def paper_signal(signal_data: dict):
     """Shortcut für /paper/signal"""
     from paper_api import process_signal
     from pydantic import BaseModel
-    from fastapi import HTTPException
-    
-    # Only support paper_test_hf model
-    if signal_data.get("model_id") != "paper_test_hf":
-        raise HTTPException(
-            status_code=403, 
-            detail=f"Model '{signal_data.get('model_id')}' is not supported. Only 'paper_test_hf' is active."
-        )
     
     class SignalRequest(BaseModel):
         model_id: str

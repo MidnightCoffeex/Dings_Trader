@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import requests
 import time
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from stable_baselines3 import PPO
 
 # Ensure we can import TraderHimSelf and ml modules
@@ -40,6 +40,8 @@ except Exception as _e:
     # Inference can still run in standalone mode; registry features will be disabled.
     get_model_package = None  # type: ignore
     set_model_package_warmup_status = None  # type: ignore
+
+from feature_cache import get_feature_cache
 
 logger = logging.getLogger("PPOInference")
 # Configure logger if not already configured
@@ -167,14 +169,90 @@ def compute_forecast_features(forecast_seq):
     all_feats = np.array(horizon_feats + path_feats + stats_feats, dtype=np.float32)
     return all_feats
 
+def fetch_candles_shared(symbol="BTCUSDT", lookback_total=1500) -> pd.DataFrame:
+    """
+    Fetches enough 15m candles from Binance to support feature calc + lookback.
+    Default lookback_total: 1500.
+    """
+    cache = get_feature_cache()
+    cache_key = f"candles_{symbol}_{lookback_total}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    base_url = "https://api.binance.com/api/v3/klines"
+    interval = "15m"
+    
+    # If we need more than 1000, we need multiple calls
+    all_data = []
+    end_time = None
+    
+    needed = lookback_total
+    while needed > 0:
+        limit = min(needed, 1000)
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        if end_time:
+            params["endTime"] = end_time - 1
+            
+        try:
+            r = requests.get(base_url, params=params, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            if not data:
+                break
+            all_data = data + all_data
+            end_time = data[0][0]
+            needed -= len(data)
+        except Exception as e:
+            logger.error(f"Binance API error: {e}")
+            if not all_data:
+                raise
+            break
+
+    cols = ["open_time", "open", "high", "low", "close", "volume", 
+            "close_time", "quote_asset_volume", "num_trades", 
+            "taker_buy_base", "taker_buy_quote", "ignore"]
+    
+    df = pd.DataFrame(all_data, columns=cols)
+    
+    # Convert numeric
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = df[c].astype(float)
+        
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    df = df.set_index("open_time").sort_index()
+    
+    # De-dupe index
+    df = df[~df.index.duplicated(keep='last')]
+    
+    cache.set(cache_key, df, ttl=60) # Cache for 60s
+    return df
+
+def get_shared_features(symbol="BTCUSDT", lookback_total=1500) -> Tuple[pd.DataFrame, float]:
+    cache = get_feature_cache()
+    cache_key = f"features_data_{symbol}_{lookback_total}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+    
+    df = fetch_candles_shared(symbol, lookback_total)
+    feats_df = compute_core_features(df)
+    last_price = float(df['close'].iloc[-1])
+    
+    result = (feats_df, last_price)
+    cache.set(cache_key, result, ttl=60)
+    return result
+
 class PPOForecastInference:
     def __init__(
         self,
         model_package_id: str = "ppo_v1",
         forecast_rel_path: str | None = None,
         ppo_rel_path: str | None = None,
+        feature_mask: Optional[List[int]] = None,
     ):
         self.model_package_id = model_package_id
+        self.feature_mask = feature_mask
         self.scaler = None
         self.forecast_model = None
         self.ppo_model = None
@@ -189,6 +267,11 @@ class PPOForecastInference:
             if pkg:
                 forecast_rel_path = pkg.get("forecast_rel_path")
                 ppo_rel_path = pkg.get("ppo_rel_path")
+                if self.feature_mask is None and pkg.get("feature_mask"):
+                    try:
+                        self.feature_mask = json.loads(pkg.get("feature_mask"))
+                    except Exception:
+                        logger.warning(f"Failed to parse feature_mask for {model_package_id}")
             elif model_package_id == "ppo_v1":
                 # Hardcoded fallback only for default model
                 forecast_rel_path = os.path.join("TraderHimSelf", "models", "forecast_model.pt")
@@ -256,64 +339,7 @@ class PPOForecastInference:
             "value": value,
         }
 
-    def fetch_candles(self, symbol="BTCUSDT") -> pd.DataFrame:
-        """
-        Fetches enough 15m candles from Binance to support feature calc + lookback.
-        We need: 672 (feature warm up) + 512 (model lookback) = 1184 candles.
-        Safe buffer: 1500.
-        """
-        base_url = "https://api.binance.com/api/v3/klines"
-        interval = "15m"
-        limit_per_call = 1000
-        
-        # 1. Fetch Latest
-        params = {"symbol": symbol, "interval": interval, "limit": limit_per_call}
-        try:
-            r = requests.get(base_url, params=params, timeout=10)
-            r.raise_for_status()
-            data1 = r.json()
-        except Exception as e:
-            logger.error(f"Binance API error: {e}")
-            raise
-
-        if not data1:
-            raise ValueError("No data returned from Binance.")
-
-        # 2. Fetch Previous
-        start_time = data1[0][0]
-        params["endTime"] = start_time - 1
-        # We need ~500 more. limit=500 is enough.
-        params["limit"] = 500
-        
-        try:
-            r2 = requests.get(base_url, params=params, timeout=10)
-            r2.raise_for_status()
-            data2 = r2.json()
-        except Exception as e:
-            logger.warning(f"Binance API secondary fetch error: {e}. Proceeding with partial data.")
-            data2 = []
-
-        full_data = data2 + data1
-        
-        cols = ["open_time", "open", "high", "low", "close", "volume", 
-                "close_time", "quote_asset_volume", "num_trades", 
-                "taker_buy_base", "taker_buy_quote", "ignore"]
-        
-        df = pd.DataFrame(full_data, columns=cols)
-        
-        # Convert numeric
-        for c in ["open", "high", "low", "close", "volume"]:
-            df[c] = df[c].astype(float)
-            
-        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-        df = df.set_index("open_time").sort_index()
-        
-        # De-dupe index
-        df = df[~df.index.duplicated(keep='last')]
-        
-        return df
-
-    def predict(self, symbol="BTCUSDT", account_state: Optional[List[float]] = None) -> Dict[str, Any]:
+    def predict(self, symbol="BTCUSDT", account_state: Optional[List[float]] = None, lookback_total: int = 1500) -> Dict[str, Any]:
         """
         Main inference method.
         Returns dict with signal, confidence, etc.
@@ -334,15 +360,10 @@ class PPOForecastInference:
                 except Exception:
                     pkg = None
 
-            # 1. Get Data
-            df = self.fetch_candles(symbol)
+            # 1. Get Shared Features
+            feats_df, current_price = get_shared_features(symbol, lookback_total)
             
-            # 2. Compute Core Features
-            # feature_engine.compute_core_features expects open, high, low, close, volume
-            # and DatetimeIndex.
-            feats_df = compute_core_features(df)
-            
-            # 3. Prepare for Forecast Model
+            # 2. Prepare for Forecast Model
             # Remove initial NaNs caused by rolling windows
             valid_feats = feats_df.dropna()
             
@@ -360,7 +381,15 @@ class PPOForecastInference:
             
             # Scale
             # transform returns numpy array
-            scaled_input = self.scaler.transform(input_df[FEATURE_COLUMNS].values)
+            raw_features = input_df[FEATURE_COLUMNS].values
+            
+            # Apply feature mask if present (pro Modell feature selection)
+            if self.feature_mask is not None:
+                mask = np.array(self.feature_mask)
+                if len(mask) == len(FEATURE_COLUMNS):
+                    raw_features = raw_features * mask
+
+            scaled_input = self.scaler.transform(raw_features)
             
             # To Tensor: (1, 512, 28)
             input_tensor = torch.tensor(scaled_input, dtype=torch.float32).unsqueeze(0).to(self.device)
@@ -418,8 +447,6 @@ class PPOForecastInference:
                 confidence = min((abs(act_dir_raw) - 0.33) / 0.67 * 100 + 50, 99)
                 sentiment = "bearish"
                 
-            current_price = float(df['close'].iloc[-1])
-            
             result = {
                 "signal": direction,
                 "confidence": int(confidence),

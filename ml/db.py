@@ -53,7 +53,8 @@ def init_db():
         warmup_required INTEGER NOT NULL DEFAULT 1,
         warmup_status TEXT NOT NULL DEFAULT 'PENDING',
         warmup_completed_at TIMESTAMP,
-        warmup_error TEXT
+        warmup_error TEXT,
+        feature_mask TEXT
     )
     """)
 
@@ -61,7 +62,12 @@ def init_db():
     try:
         cursor.execute("ALTER TABLE model_packages ADD COLUMN warmup_error TEXT")
     except sqlite3.OperationalError:
-        # Column already exists
+        pass
+
+    # Migration: Add feature_mask if missing
+    try:
+        cursor.execute("ALTER TABLE model_packages ADD COLUMN feature_mask TEXT")
+    except sqlite3.OperationalError:
         pass
 
     conn.commit()

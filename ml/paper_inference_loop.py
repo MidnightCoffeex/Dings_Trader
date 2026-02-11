@@ -21,7 +21,7 @@ from paper_trading import get_paper_engine
 API_BASE = "http://127.0.0.1:8000"
 
 
-def run_inference_cycle(model_id: str, symbol: str = "BTCUSDT"):
+def run_inference_cycle(model_id: str, symbol: str = "BTCUSDT", lookback_total: int = 1500):
     """Führt einen einzelnen Inference-Zyklus aus."""
     try:
         # 1. Fetch current price
@@ -38,7 +38,7 @@ def run_inference_cycle(model_id: str, symbol: str = "BTCUSDT"):
             return False
         
         # 2. Get ML Signal
-        signal_res = requests.get(f"{API_BASE}/paper/ml-signal/{model_id}?symbol={symbol}", timeout=30)
+        signal_res = requests.get(f"{API_BASE}/paper/ml-signal/{model_id}?symbol={symbol}&lookback_total={lookback_total}", timeout=60)
         if not signal_res.ok:
             print(f"[{datetime.now()}] Error fetching signal: {signal_res.status_code}")
             return False
@@ -100,6 +100,7 @@ def main():
     parser.add_argument("--model-id", default="paper_v1", help="Model ID for paper trading")
     parser.add_argument("--symbol", default="BTCUSDT", help="Trading symbol")
     parser.add_argument("--interval", type=int, default=60, help="Interval in seconds between checks")
+    parser.add_argument("--warmup-candles", type=int, default=1500, help="Number of candles for warmup")
     parser.add_argument("--once", action="store_true", help="Run once and exit")
     parser.add_argument("--create-account", action="store_true", help="Create account if not exists")
     args = parser.parse_args()
@@ -124,17 +125,18 @@ def main():
     
     if args.once:
         print(f"[{datetime.now()}] Running single inference cycle...")
-        run_inference_cycle(args.model_id, args.symbol)
+        run_inference_cycle(args.model_id, args.symbol, args.warmup_candles)
     else:
         print(f"[{datetime.now()}] Starting Paper Trading Loop...")
         print(f"  Model ID: {args.model_id}")
         print(f"  Symbol: {args.symbol}")
         print(f"  Interval: {args.interval}s")
+        print(f"  Warmup: {args.warmup_candles} candles")
         print(f"  Press Ctrl+C to stop")
         print()
         
         while True:
-            run_inference_cycle(args.model_id, args.symbol)
+            run_inference_cycle(args.model_id, args.symbol, args.warmup_candles)
             print()
             time.sleep(args.interval)
 

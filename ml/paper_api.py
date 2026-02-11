@@ -37,6 +37,7 @@ def _resolve_model_package_id(model_id: str) -> str:
 
 class CreateAccountRequest(BaseModel):
     model_id: str
+    model_package_id: Optional[str] = None
     initial_balance: float = 10000.0
     max_positions: int = 5
     default_leverage: float = 7.0
@@ -81,6 +82,7 @@ async def create_account(req: CreateAccountRequest):
     engine = get_paper_engine()
     account = engine.create_account(
         model_id=req.model_id,
+        model_package_id=req.model_package_id,
         initial_balance=req.initial_balance,
         max_positions=req.max_positions,
         default_leverage=req.default_leverage,
@@ -91,6 +93,7 @@ async def create_account(req: CreateAccountRequest):
         "success": True,
         "account": {
             "model_id": account.model_id,
+            "model_package_id": account.model_package_id,
             "balance_usdt": account.balance_usdt,
             "total_equity": account.total_equity,
             "initial_balance": account.initial_balance,
@@ -122,7 +125,7 @@ async def get_account(model_id: str):
 
     return {
         "model_id": account.model_id,
-        "model_package_id": package_id,
+        "model_package_id": account.model_package_id,
         "warmup_required": bool(pkg and int(pkg.get("warmup_required", 0)) == 1),
         "warmup_status": (pkg or {}).get("warmup_status"),
         "balance_usdt": account.balance_usdt,
@@ -324,7 +327,7 @@ async def process_signal(req: SignalRequest):
                 result["actions"].append(f"Closed {pos.side} position due to signal flip")
     
     # 3. Block auto-trading until model package warmup is completed
-    package_id = _resolve_model_package_id(req.model_id)
+    package_id = account.model_package_id
     pkg = get_model_package(package_id) if package_id else None
     if pkg and int(pkg.get("warmup_required", 0)) == 1 and pkg.get("warmup_status") != "DONE":
         result["actions"].append(
@@ -383,13 +386,20 @@ async def process_signal(req: SignalRequest):
 
 # ML Signal Endpoints
 @router.get("/ml-signal/{model_id}")
-async def get_ml_signal(model_id: str, symbol: str = "BTCUSDT"):
+async def get_ml_signal(model_id: str, symbol: str = "BTCUSDT", lookback_total: int = 1500):
     """Holt aktuelles ML-Signal mit Confidence (PPO+Forecast)."""
     try:
-        # Use PPO Forecast Inference (per model package)
-        package_id = _resolve_model_package_id(model_id)
+        engine = get_paper_engine()
+        account = engine.get_account(model_id)
+        
+        if account:
+            package_id = account.model_package_id
+        else:
+            # Fallback
+            package_id = _resolve_model_package_id(model_id)
+            
         inf = get_inference(model_package_id=package_id)
-        result = inf.predict(symbol=symbol)
+        result = inf.predict(symbol=symbol, lookback_total=lookback_total)
         
         if "error" in result:
              raise HTTPException(status_code=500, detail=result["error"])
@@ -431,7 +441,13 @@ async def get_ml_signal(model_id: str, symbol: str = "BTCUSDT"):
 async def get_ml_signal_lite(model_id: str, symbol: str = "BTCUSDT"):
     """Lite Signal: ohne Forecast-Payload (für schnelle UI-Updates)."""
     try:
-        package_id = _resolve_model_package_id(model_id)
+        engine = get_paper_engine()
+        account = engine.get_account(model_id)
+        if account:
+            package_id = account.model_package_id
+        else:
+            package_id = _resolve_model_package_id(model_id)
+            
         inf = get_inference(model_package_id=package_id)
         result = inf.predict(symbol=symbol)
         
@@ -472,7 +488,7 @@ async def get_dashboard_data(model_id: str):
     
     # Get ML signal (PPO+Forecast)
     try:
-        package_id = _resolve_model_package_id(model_id)
+        package_id = account.model_package_id
         inf = get_inference(model_package_id=package_id)
         res = inf.predict(symbol="BTCUSDT")
         
