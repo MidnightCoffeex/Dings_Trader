@@ -270,6 +270,33 @@ def make_env(df_15m, df_3m):
         raise ValueError(f"Missing columns in df_15m: {missing[:5]}...")
     return TrainingPerpEnv(df_15m, df_3m, feature_cols)
 
+
+def make_env_fn(df_15m, df_3m):
+    """Factory for VecEnv workers."""
+    return lambda: make_env(df_15m, df_3m)
+
+
+def build_vec_env(df_15m, df_3m, *, n_envs: int, vec_env: str):
+    if n_envs <= 1:
+        return DummyVecEnv([make_env_fn(df_15m, df_3m)]), "dummy"
+
+    mode = vec_env
+    if mode == "auto":
+        mode = "subproc"
+
+    if mode == "subproc":
+        try:
+            env = SubprocVecEnv([make_env_fn(df_15m, df_3m) for _ in range(n_envs)], start_method="fork")
+        except TypeError:
+            env = SubprocVecEnv([make_env_fn(df_15m, df_3m) for _ in range(n_envs)])
+        return env, "subproc"
+
+    if mode == "dummy":
+        env = DummyVecEnv([make_env_fn(df_15m, df_3m) for _ in range(n_envs)])
+        return env, "dummy"
+
+    raise ValueError(f"Unknown vec env mode: {vec_env}")
+
 def get_config(args) -> Dict[str, Any]:
     config = {
         'total_timesteps': 1_000_000,
@@ -305,6 +332,9 @@ def main():
     parser.add_argument("--profile", choices=['default', 'high-util'], default='default')
     parser.add_argument("--n-steps", type=int, help="PPO n_steps")
     parser.add_argument("--batch-size", type=int, help="PPO batch_size")
+    parser.add_argument("--n-envs", type=int, default=1, help="Number of parallel environments")
+    parser.add_argument("--vec-env", choices=["auto", "dummy", "subproc"], default="auto", help="Vectorized env backend")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="Training device")
     args = parser.parse_args()
     
     cfg = get_config(args)
@@ -312,15 +342,23 @@ def main():
     
     try:
         df_15m, df_3m = load_data(allow_dummy_forecast=args.allow_dummy_forecast)
-    except FileNotFoundError as e:
+    except (FileNotFoundError, ValueError) as e:
         print(f"Fehler beim Laden der Daten: {e}")
         return
 
-    # Using DummyVecEnv as PerEnv is pandas-based and fast enough for single process usually.
-    # Parallelizing via SubprocVecEnv would require pickling large DataFrames which is inefficient.
-    env = DummyVecEnv([lambda: make_env(df_15m, df_3m)])
-    
-    print("Initialisiere PPO Agent...")
+    env, env_mode = build_vec_env(df_15m, df_3m, n_envs=max(1, int(args.n_envs)), vec_env=args.vec_env)
+    print(f"VecEnv mode: {env_mode} | n_envs={max(1, int(args.n_envs))}")
+
+    if args.device == "cpu":
+        model_device = "cpu"
+    elif args.device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("--device cuda requested but CUDA is not available")
+        model_device = "cuda"
+    else:
+        model_device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    print(f"Initialisiere PPO Agent auf device={model_device}...")
     policy_kwargs = dict(
         net_arch=dict(pi=[256, 256], vf=[256, 256]),
         activation_fn=torch.nn.Tanh,
@@ -340,7 +378,7 @@ def main():
         verbose=1,
         tensorboard_log=LOG_DIR,
         policy_kwargs=policy_kwargs,
-        device="cuda" if torch.cuda.is_available() else "cpu"
+        device=model_device
     )
     
     checkpoint_callback = CheckpointCallback(
