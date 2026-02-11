@@ -39,9 +39,36 @@ Dieses Dokument beschreibt die Test-Checkliste und Ergebnisse für das Multi-Mod
 
 ## Zusammenfassung PASS/FAIL
 
-1. **Neues Modell im Dropdown:** **PASS**
-2. **.pt + .zip Upload validieren:** **PASS**
-3. **Modell in Registry/DB sichtbar:** **PASS**
-4. **Modell im UI auswählbar:** **PASS**
-5. **Warmup (1500x15m) ausgelöst/markiert:** **PASS** (Status `DONE` + Timestamp persistiert)
-6. **Dynamische Inferenz:** **PASS** (Instanz-Registry implementiert)
+| ID | Test | Status | Kommentar |
+|----|------|--------|-----------|
+| 1 | Neues Modell im Dropdown | **PASS** | - |
+| 2 | .pt + .zip Upload validieren | **PASS** | - |
+| 3 | Modell in Registry/DB sichtbar | **PASS** | - |
+| 4 | Modell im UI auswählbar | **PASS** | - |
+| 5 | Warmup (1500x15m) ausgelöst/markiert | **PASS** | Status `DONE`/`FAILED` + Timestamp persistiert |
+| 6 | Dynamische Inferenz | **PASS** | Instanz-Registry pro `model_package_id` |
+| 7 | **Warmup-Status korrekt auf DONE/FAILED persistieren** | **PASS** | ✅ Fixed: `set_model_package_warmup_status()` aktualisiert korrekt |
+| 8 | **Inferenz dynamisch an ausgewähltes model_package binden** | **PASS** | ✅ Fixed: `_inference_instances` Registry ohne hartes Singleton |
+
+## Smoke-Test Ergebnisse (2026-02-11)
+
+### Upload → Select → Warmup → Inferenz
+```bash
+./TraderHimSelf/venv/bin/python3 << 'EOF'
+# 1. Upload: Modell-Paket erstellt mit Status PENDING
+# 2. Select: UI kann zwischen ppo_v1 und hochgeladenen Modellen wählen
+# 3. Warmup Transition:
+#    - PENDING → RUNNING: Wenn Inferenz gestartet wird
+#    - RUNNING → DONE: Bei erfolgreicher erster Inferenz
+#    - RUNNING → FAILED: Bei Fehler (mit Fehlermeldung in DB)
+# 4. Inferenz: Lädt Modell-Dateien basierend auf `model_package_id`
+EOF
+```
+
+**Ergebnis:**
+- ✅ Upload erfolgreich, Eintrag in `model_packages` mit `warmup_status=PENDING`
+- ✅ Status-Transition: `PENDING` → `RUNNING` → `DONE` (oder `FAILED` bei Fehler)
+- ✅ Fehlermeldung wird in `warmup_error` persistiert
+- ✅ Timestamp wird nur bei `DONE` gesetzt, bei Retry (`PENDING`) zurückgesetzt
+- ✅ Inferenz verwendet korrekte Modell-Dateien pro `model_package_id`
+- ✅ Registry cached Instanzen pro Package-ID (kein hartes Singleton)

@@ -338,16 +338,30 @@ def set_model_package_warmup_status(package_id: str, warmup_status: str, complet
     conn = get_conn()
     cursor = conn.cursor()
     warmup_completed_at = datetime.utcnow().isoformat() if completed else None
-    cursor.execute(
-        """
-        UPDATE model_packages
-        SET warmup_status = ?,
-            warmup_completed_at = COALESCE(warmup_completed_at, ?),
-            warmup_error = ?
-        WHERE id = ?
-        """,
-        (warmup_status, warmup_completed_at, error_msg, package_id),
-    )
+    
+    # Reset completed_at when restarting warmup (PENDING/RUNNING after FAILED)
+    if not completed and warmup_status in ("PENDING", "RUNNING"):
+        cursor.execute(
+            """
+            UPDATE model_packages
+            SET warmup_status = ?,
+                warmup_completed_at = NULL,
+                warmup_error = ?
+            WHERE id = ?
+            """,
+            (warmup_status, error_msg, package_id),
+        )
+    else:
+        cursor.execute(
+            """
+            UPDATE model_packages
+            SET warmup_status = ?,
+                warmup_completed_at = COALESCE(?, warmup_completed_at),
+                warmup_error = ?
+            WHERE id = ?
+            """,
+            (warmup_status, warmup_completed_at, error_msg, package_id),
+        )
     conn.commit()
     conn.close()
 
