@@ -198,9 +198,14 @@ def map_funding_stepwise(
 
 
 def add_time_ms_column(df: pd.DataFrame, name: str) -> pd.DataFrame:
-    """Add a millisecond epoch column from UTC DatetimeIndex."""
+    """Add a millisecond epoch column from a UTC DatetimeIndex.
+
+    Note: Parquet round-trips can store timestamps at different resolutions (ns/us/ms).
+    We therefore normalize via an explicit conversion to datetime64[ns] first.
+    """
     out = df.copy()
-    out[name] = out.index.view("int64") // 10**6
+    idx_ns = out.index.to_numpy(dtype="datetime64[ns]")
+    out[name] = (idx_ns.view("int64") // 10**6).astype("int64")
     return out
 
 

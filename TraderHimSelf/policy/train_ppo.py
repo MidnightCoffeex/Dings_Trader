@@ -134,25 +134,47 @@ def _rename_fc_feat_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _slot15m_to_ms(series: pd.Series) -> pd.Series:
-    """Normalize slot_15m values to int64 millisecond timestamps."""
+    """Normalize slot_15m values to epoch milliseconds.
+
+    Handles datetime columns that may be stored at different resolutions (ns/us/ms)
+    after Parquet round-trips.
+    """
     s = series.copy()
 
     if pd.api.types.is_datetime64_any_dtype(s):
-        return (s.astype("int64") // 10**6).astype("int64")
+        arr_ns = pd.to_datetime(s, utc=True, errors="coerce").to_numpy(dtype="datetime64[ns]")
+        ms = arr_ns.view("int64") // 10**6
+        # NaT becomes int64 min; convert to NaN so downstream filters can drop it.
+        ms = ms.astype("float64")
+        ms[ms <= -9e18] = np.nan
+        return pd.Series(ms, index=s.index, name=s.name)
 
     if pd.api.types.is_numeric_dtype(s):
         s_num = pd.to_numeric(s, errors="coerce")
-        # Heuristic: nanosecond epochs are much larger than ms epochs.
-        if s_num.dropna().median() > 10**14:
+        med = float(s_num.dropna().median()) if s_num.dropna().size else 0.0
+        # Heuristics:
+        # - ns epoch ~1e18
+        # - us epoch ~1e15
+        # - ms epoch ~1e12
+        # - s  epoch ~1e9
+        if med > 10**17:
             s_num = s_num // 10**6
-        return s_num.astype("int64")
+        elif med > 10**14:
+            s_num = s_num // 10**3
+        elif med > 10**11:
+            s_num = s_num
+        elif med > 10**9:
+            s_num = s_num * 1000
+        return s_num
 
     # Fallback: parse strings/objects as datetime
     s_dt = pd.to_datetime(s, utc=True, errors="coerce")
     if s_dt.isna().any():
         bad = int(s_dt.isna().sum())
         raise ValueError(f"slot_15m contains {bad} unparsable values")
-    return (s_dt.astype("int64") // 10**6).astype("int64")
+    arr_ns = s_dt.to_numpy(dtype="datetime64[ns]")
+    ms = arr_ns.view("int64") // 10**6
+    return pd.Series(ms.astype("int64"), index=s.index, name=s.name)
 
 
 def load_data(*, allow_dummy_forecast: bool = False):
@@ -164,6 +186,12 @@ def load_data(*, allow_dummy_forecast: bool = False):
     if not os.path.exists(p_15m):
         raise FileNotFoundError(f"{p_15m} nicht gefunden. Bitte erst build_dataset.py ausführen.")
     df_15m = pd.read_parquet(p_15m)
+
+    # Ensure open_time_ms is truly epoch-ms (robust against Parquet timestamp resolution).
+    if isinstance(df_15m.index, pd.DatetimeIndex):
+        idx_ns = df_15m.index.to_numpy(dtype="datetime64[ns]")
+        df_15m["open_time_ms"] = (idx_ns.view("int64") // 10**6).astype("int64")
+
     
     # 2. Candles 3m
     p_3m = os.path.join(BASE_DATA_DIR, "aligned_3m.parquet")

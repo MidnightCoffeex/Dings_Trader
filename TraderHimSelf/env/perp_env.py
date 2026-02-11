@@ -104,8 +104,19 @@ class PerpEnv(gym.Env):
             raise ValueError("df_3m missing required column: slot_15m")
 
         # Precompute 15m->3m mapping via slot_15m
-        # Maps 15m open_time_ms -> array of 3m indices (expected 5 subbars)
-        self._slot_to_3m_idx = self.df_3m.groupby("slot_15m").indices
+        # Maps 15m open_time_ms (epoch-ms) -> array of 3m indices (expected 5 subbars)
+        slot = self.df_3m["slot_15m"]
+        if pd.api.types.is_datetime64_any_dtype(slot):
+            arr_ns = pd.to_datetime(slot, utc=True, errors="coerce").to_numpy(dtype="datetime64[ns]")
+            ms = arr_ns.view("int64") // 10**6
+            self.df_3m["_slot_15m_ms"] = ms.astype("int64")
+        else:
+            slot_num = pd.to_numeric(slot, errors="coerce")
+            if slot_num.isna().any():
+                raise ValueError("df_3m slot_15m contains NaN/unparseable values")
+            self.df_3m["_slot_15m_ms"] = slot_num.astype("int64")
+
+        self._slot_to_3m_idx = self.df_3m.groupby("_slot_15m_ms").indices
 
         # Funding rates aligned to 15m steps
         if "funding_rate" in self.df_15m.columns:
@@ -244,7 +255,7 @@ class PerpEnv(gym.Env):
         tp_mult = 0.5 + ((act_tp_raw + 1) / 2.0) * 5.5 # Map -1..1 to 0.5..6.0
 
         # --- INTRABAR SUBBARS (5x 3m of T+1) ---
-        slot_key = next_candle["open_time_ms"]
+        slot_key = int(next_candle["open_time_ms"])
         idxs = self._slot_to_3m_idx.get(slot_key)
         sub_candles = self.df_3m.iloc[idxs] if idxs is not None else self.df_3m.iloc[0:0]
 
