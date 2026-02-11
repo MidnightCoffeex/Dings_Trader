@@ -369,6 +369,28 @@ def _make_grad_scaler(device: torch.device, enabled: bool):
     return torch.cuda.amp.GradScaler(enabled=True)
 
 
+def _state_dict_for_saving(model: nn.Module):
+    base_model = getattr(model, "_orig_mod", model)
+    return base_model.state_dict()
+
+
+def _normalize_loaded_state_dict(state_dict: dict):
+    if not isinstance(state_dict, dict):
+        raise TypeError(f"Expected state_dict dict, got {type(state_dict)}")
+
+    has_orig_mod_prefix = any(str(k).startswith("_orig_mod.") for k in state_dict.keys())
+    if not has_orig_mod_prefix:
+        return state_dict
+
+    normalized = {}
+    for k, v in state_dict.items():
+        k = str(k)
+        if k.startswith("_orig_mod."):
+            k = k[len("_orig_mod."):]
+        normalized[k] = v
+    return normalized
+
+
 def train_model(args):
     cfg = get_config(args)
     logger.info(f"Configuration: {cfg}")
@@ -505,7 +527,7 @@ def train_model(args):
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), os.path.join(MODEL_DIR, "forecast_model.pt"))
+            torch.save(_state_dict_for_saving(model), os.path.join(MODEL_DIR, "forecast_model.pt"))
             logger.info("Saved best model.")
 
 def precompute_features(args):
@@ -540,7 +562,9 @@ def precompute_features(args):
         )
 
     # Load weights before compile
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    raw_state = torch.load(model_path, map_location=device)
+    state_dict = _normalize_loaded_state_dict(raw_state)
+    model.load_state_dict(state_dict)
 
     if cfg['compile']:
         model = torch.compile(model)
