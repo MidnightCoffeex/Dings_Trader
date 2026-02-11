@@ -62,16 +62,11 @@ FEATURE_COLUMNS: List[str] = [
     # E) Volume
     "vol_log",
     "vol_z_96",
-    # F) Time (UTC, cyclic + session flags + optional seasonality)
+    # F) Time (UTC, cyclic)
     "hour_sin",
     "hour_cos",
     "dow_sin",
     "dow_cos",
-    "session_asia",
-    "session_europe",
-    "session_us",
-    "woy_sin",
-    "woy_cos",
     # G) Funding
     "funding_rate_now",
     "time_to_next_funding_steps",
