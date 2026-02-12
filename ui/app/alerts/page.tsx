@@ -1,20 +1,19 @@
+"use client";
+
+import { AppShell } from "@/components/layout/app-shell";
 import { PageHeader } from "@/components/layout/page-header";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { Suspense } from "react";
 
-export default function AlertsPage() {
+function AlertsContent() {
   return (
     <div className="space-y-6">
-      <PageHeader
-        title="Alerts"
-        subtitle="Risk, drift, and execution notifications."
-      />
+      <PageHeader title="Alerts" subtitle="Risk, drift, and execution notifications." />
 
       <Card className="bg-card/40">
         <CardHeader className="pb-3">
-          <CardTitle className="text-sm font-medium text-muted-foreground">
-            Recent Alerts
-          </CardTitle>
+          <CardTitle className="text-sm font-medium text-muted-foreground">Recent Alerts</CardTitle>
         </CardHeader>
         <CardContent>
           <div className="space-y-3">
@@ -35,10 +34,7 @@ export default function AlertsPage() {
                 sev: "success",
               },
             ].map((a) => (
-              <div
-                key={a.t}
-                className="rounded-md border border-border/70 bg-background/30 p-4"
-              >
+              <div key={a.t} className="rounded-md border border-border/70 bg-background/30 p-4">
                 <div className="flex items-start justify-between gap-3">
                   <div className="min-w-0">
                     <div className="truncate text-sm font-medium">{a.t}</div>
@@ -52,5 +48,15 @@ export default function AlertsPage() {
         </CardContent>
       </Card>
     </div>
+  );
+}
+
+export default function AlertsPage() {
+  return (
+    <AppShell>
+      <Suspense fallback={<div>Loading alerts...</div>}>
+        <AlertsContent />
+      </Suspense>
+    </AppShell>
   );
 }

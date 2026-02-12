@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, Suspense } from "react";
 import { ChevronDown, Plus, Upload, X } from "lucide-react";
 import { useRouter, useSearchParams } from "next/navigation";
 
@@ -273,7 +273,7 @@ function AddModelModal({
   );
 }
 
-export function ModelSelector() {
+function ModelSelectorContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const currentId = searchParams.get("model") || "ppo_v1";
@@ -369,5 +369,13 @@ export function ModelSelector() {
 
       <AddModelModal open={addOpen} onClose={() => setAddOpen(false)} onCreated={handleCreated} />
     </>
+  );
+}
+
+export function ModelSelector() {
+  return (
+    <Suspense fallback={<Button variant="outline" disabled>Loading Models...</Button>}>
+      <ModelSelectorContent />
+    </Suspense>
   );
 }

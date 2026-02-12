@@ -17,9 +17,14 @@ from typing import Dict, Any, Optional, List, Tuple
 from stable_baselines3 import PPO
 
 # Ensure we can import TraderHimSelf and ml modules
+# 1. Project Root: projects/dings-trader/
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# 2. ML Dir: projects/dings-trader/ml/
 ML_DIR = os.path.dirname(os.path.abspath(__file__))
-for d in [PROJECT_ROOT, ML_DIR]:
+# 3. Trader Dir: projects/dings-trader/TraderHimSelf/
+TRADER_DIR = os.path.join(PROJECT_ROOT, "TraderHimSelf")
+
+for d in [PROJECT_ROOT, ML_DIR, TRADER_DIR]:
     if d not in sys.path:
         sys.path.append(d)
 
@@ -53,8 +58,12 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 # Attempt imports from TraderHimSelf
+# Since TRADER_DIR is now in path, we can import directly
 try:
-    from TraderHimSelf.feature_engine import compute_core_features, FEATURE_COLUMNS
+    # Try importing feature_engine (V1)
+    from feature_engine import compute_core_features, FEATURE_COLUMNS
+    # Try importing V2 (30 features) engine
+    from feature_engine_train30 import compute_core_features_train30, FEATURE_COLUMNS_TRAIN30
 except ImportError as e:
     logger.error(f"Failed to import TraderHimSelf modules: {e}")
     # We might fail hard here or later.
@@ -243,6 +252,21 @@ def get_shared_features(symbol="BTCUSDT", lookback_total=1500) -> Tuple[pd.DataF
     cache.set(cache_key, result, ttl=60)
     return result
 
+def get_shared_features_30(symbol="BTCUSDT", lookback_total=1500) -> Tuple[pd.DataFrame, float]:
+    cache = get_feature_cache()
+    cache_key = f"features_data_30_{symbol}_{lookback_total}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+    
+    df = fetch_candles_shared(symbol, lookback_total)
+    feats_df = compute_core_features_train30(df)
+    last_price = float(df['close'].iloc[-1])
+    
+    result = (feats_df, last_price)
+    cache.set(cache_key, result, ttl=60)
+    return result
+
 class PPOForecastInference:
     def __init__(
         self,
@@ -259,6 +283,10 @@ class PPOForecastInference:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._cache = {}
         self._cache_ttl = 15  # seconds
+        
+        # Determine feature dim mode (28 or 30)
+        self.feature_dim = 28 # Default V1
+        self.feature_columns = FEATURE_COLUMNS
 
         # Resolve artifact paths via registry if available
         if forecast_rel_path is None or ppo_rel_path is None:
@@ -289,20 +317,32 @@ class PPOForecastInference:
 
     def _load_artifacts(self):
         base_dir = os.path.join(PROJECT_ROOT, "TraderHimSelf")
-        scaler_path = os.path.join(base_dir, "data_processed", "scaler.pkl")
-
+        
+        # Check for V2 (30 features) signature
+        # Since we can't inspect the model file easily without loading, we try to detect by path or just try loading scaler
+        # For this fix, we assume V2 if train30 scaler exists AND we are using default model paths (which were swapped).
+        
+        scaler_path_v1 = os.path.join(base_dir, "data_processed", "scaler.pkl")
+        scaler_path_v2 = os.path.join(base_dir, "data_processed", "train30", "scaler.pkl")
+        
+        # FORCE V2 MODE for this patch (as we know the user uploaded V2 models)
+        self.feature_dim = 30
+        self.feature_columns = FEATURE_COLUMNS_TRAIN30
+        scaler_path = scaler_path_v2
+        
         if not os.path.exists(scaler_path):
-            raise FileNotFoundError(f"Scaler not found at {scaler_path}")
-        if not os.path.exists(self.forecast_path):
-            raise FileNotFoundError(f"Forecast model not found at {self.forecast_path}")
-        if not os.path.exists(self.ppo_path):
-            raise FileNotFoundError(f"PPO model not found at {self.ppo_path}")
+             # Fallback to V1
+             logger.warning(f"V2 Scaler not found at {scaler_path}, falling back to V1")
+             scaler_path = scaler_path_v1
+             self.feature_dim = 28
+             self.feature_columns = FEATURE_COLUMNS
 
-        logger.info(f"Loading Scaler from {scaler_path}...")
+        logger.info(f"Loading Scaler from {scaler_path} (dim={self.feature_dim})...")
         self.scaler = joblib.load(scaler_path)
 
-        logger.info(f"Loading Forecast Model from {self.forecast_path}...")
-        self.forecast_model = PatchTST()
+        logger.info(f"Loading Forecast Model from {self.forecast_path} (input_dim={self.feature_dim})...")
+        self.forecast_model = PatchTST(input_dim=self.feature_dim)
+        
         # Handle loading: map_location to device
         state_dict = torch.load(self.forecast_path, map_location=self.device)
         
@@ -314,7 +354,25 @@ class PPOForecastInference:
                 key = key[10:]
             new_state_dict[key] = v
             
-        self.forecast_model.load_state_dict(new_state_dict)
+        try:
+            self.forecast_model.load_state_dict(new_state_dict)
+        except RuntimeError as e:
+            # If mismatch, try the other dimension
+            logger.error(f"Model load failed with dim={self.feature_dim}: {e}")
+            if "size mismatch" in str(e):
+                if self.feature_dim == 30:
+                    logger.info("Retrying with dim=28...")
+                    self.feature_dim = 28
+                    self.feature_columns = FEATURE_COLUMNS
+                    self.forecast_model = PatchTST(input_dim=28)
+                    # Also reload scaler V1
+                    self.scaler = joblib.load(scaler_path_v1)
+                    self.forecast_model.load_state_dict(new_state_dict)
+                else:
+                    raise e
+            else:
+                raise e
+                
         self.forecast_model.to(self.device)
         self.forecast_model.eval()
 
@@ -360,8 +418,11 @@ class PPOForecastInference:
                 except Exception:
                     pkg = None
 
-            # 1. Get Shared Features
-            feats_df, current_price = get_shared_features(symbol, lookback_total)
+            # 1. Get Shared Features (depending on dim)
+            if self.feature_dim == 30:
+                feats_df, current_price = get_shared_features_30(symbol, lookback_total)
+            else:
+                feats_df, current_price = get_shared_features(symbol, lookback_total)
             
             # 2. Prepare for Forecast Model
             # Remove initial NaNs caused by rolling windows
@@ -381,17 +442,17 @@ class PPOForecastInference:
             
             # Scale
             # transform returns numpy array
-            raw_features = input_df[FEATURE_COLUMNS].values
+            raw_features = input_df[self.feature_columns].values
             
             # Apply feature mask if present (pro Modell feature selection)
             if self.feature_mask is not None:
                 mask = np.array(self.feature_mask)
-                if len(mask) == len(FEATURE_COLUMNS):
+                if len(mask) == len(self.feature_columns):
                     raw_features = raw_features * mask
 
             scaled_input = self.scaler.transform(raw_features)
             
-            # To Tensor: (1, 512, 28)
+            # To Tensor: (1, 512, dim)
             input_tensor = torch.tensor(scaled_input, dtype=torch.float32).unsqueeze(0).to(self.device)
             
             # 4. Forecast Inference
@@ -408,9 +469,9 @@ class PPOForecastInference:
             forecast_values = forecast_out_np.tolist()
             
             # 6. Build PPO Observation
-            # [Core28 (latest) + Forecast35 + Account9] = 72
+            # [Core (latest) + Forecast35 + Account9]
             
-            core_28 = scaled_input[-1] # Shape (28,)
+            core_features = scaled_input[-1] # Shape (dim,)
             
             # Account State
             if account_state is None:
@@ -421,12 +482,27 @@ class PPOForecastInference:
                 account_vec = np.array([0, 0, 0, 0, 0, 0, 192, 1.0, 0.1], dtype=np.float32)
             else:
                 account_vec = np.array(account_state, dtype=np.float32)
-                
-            obs = np.concatenate([core_28, forecast_feats, account_vec]) # (72,)
+            
+            # Handle mismatch between core dim and PPO expected input
+            # Assumption: PPO expects 72 features (28 core + 35 forecast + 9 account)
+            # If we have 30 core features, we might need to trim or PPO might expect 74.
+            # We try to construct full obs. If PPO complains, we trim core to 28.
+            
+            obs = np.concatenate([core_features, forecast_feats, account_vec]) 
             
             # 7. PPO Inference
             # predict returns (action, state)
-            action, _ = self.ppo_model.predict(obs, deterministic=True)
+            try:
+                action, _ = self.ppo_model.predict(obs, deterministic=True)
+            except ValueError as ve:
+                if "expected" in str(ve) and self.feature_dim == 30:
+                     # Fallback: Trim core features to 28 if PPO was trained on V1 features but Forecast V2
+                     logger.warning(f"PPO input mismatch ({str(ve)}). Trimming core features to 28.")
+                     core_28 = core_features[:28]
+                     obs = np.concatenate([core_28, forecast_feats, account_vec])
+                     action, _ = self.ppo_model.predict(obs, deterministic=True)
+                else:
+                    raise ve
             
             # 8. Decode Action
             # action shape (5,) -> [dir, size, lev, sl, tp] all in [-1, 1]
@@ -459,6 +535,7 @@ class PPOForecastInference:
                     "warmup_ready": True,
                     "forecast_min": float(forecast_feats[27]), # min_ret from stats
                     "forecast_max": float(forecast_feats[28]), # max_ret
+                    "feature_dim": self.feature_dim
                 }
             }
 

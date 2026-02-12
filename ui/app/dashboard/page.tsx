@@ -2,6 +2,7 @@ export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
 import { Suspense } from "react";
+import { AppShell } from "@/components/layout/app-shell";
 import { PageHeader } from "@/components/layout/page-header";
 import { ModelSelector } from "@/components/layout/model-selector";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -14,7 +15,7 @@ import {
   AccountBalance,
   LegacyTradeHistory,
   TradingSignalsTile,
-  TradingChart,
+  TradingChartLightweight,
   LivePriceBubble,
 } from "@/components/dashboard";
 import { PaperTradingStatus } from "@/components/layout/paper-trading-status";
@@ -357,8 +358,9 @@ export default async function DashboardPage(props: {
   );
 
   return (
-    <div className="w-full space-y-6 2xl:space-y-8">
-      <PageHeader
+    <AppShell>
+      <div className="w-full space-y-6 2xl:space-y-8">
+        <PageHeader
         title="Dings Trader Dashboard"
         subtitle="ML-gesteuertes Trading mit Echtzeit-Risk-Management"
         badge="Paper Trading v2.0"
@@ -379,7 +381,7 @@ export default async function DashboardPage(props: {
           <div className="max-w-[420px]">
             <LivePriceBubble modelId={paperModelId} symbol="BTCUSDT" />
           </div>
-          <TradingChart modelId={paperModelId} />
+          <TradingChartLightweight modelId={paperModelId} />
         </div>
         <AccountBalance account={paperData.account} modelId={paperModelId} />
       </div>
@@ -443,6 +445,7 @@ export default async function DashboardPage(props: {
         initialPositions={paperData.open_positions}
         initialTrades={paperData.recent_trades}
       />
-    </div>
+      </div>
+    </AppShell>
   );
 }

@@ -28,3 +28,22 @@ Detaillierte Aufgabenliste basierend auf der VOLLSTÄNDIGEN Sprachnachricht von 
 - [x] Max. 10 % Gesamtexposure.
 - [x] Automatisches Closing nach 48h (Timeout).
 - [x] Ziel: 5% Profit pro Trade (in der Exit-Logik verankern).
+
+## Schnittstellen-Refactor (Arg-first Pipeline, 2026-02-12)
+- [x] Notebook-Standard auf `notebooks/99_full_pipeline.ipynb` umstellen (Single Entry Point).
+- [x] Alte Step-Notebooks (`00..07`) nach Freigabe gelöscht (2026-02-12, nur `99_full_pipeline.ipynb` bleibt).
+- [x] Zentrale `PipelineConfig` als Argumente einführen:
+  - `decision_tf`, `intrabar_tf`, `forecast_horizon_steps`, `lookback`, `feature_set`, `model_tag`.
+- [ ] Unterstützte Decision-TFs parametrisieren (zuerst: `15m` + horizon `16` = 4h).
+- [ ] Intrabar-TF dauerhaft getrennt halten (`3m` bleibt Standard für SL/TP-Reihenfolge).
+- [ ] Forecast/PPO-Kopplung hart erzwingen:
+  - PPO-Training darf nur mit exakt derselben Config/Feature-Order laufen wie Forecast.
+- [x] Einheitliche Modellpaar-Ordnerstruktur einführen (Name aus Argumenten):
+  - Beispiel: `models/packages/<decision_tf>_<horizon>_<feature_set>_<timestamp>/`
+  - Inhalte: `forecast_model.pt`, `ppo_policy_final.zip`, `manifest.json`, `scaler.pkl`.
+- [ ] `manifest.json` als Source-of-Truth für Backend/UI nutzen:
+  - enthält TF, Horizon, Feature-Set, Lookback, Intrabar, Trainingszeitraum, commit hash.
+- [ ] Backend-Ladepfad auf Manifest-basierte Modellpakete erweitern (statt impliziter Dateinamen).
+- [ ] UI-Modellauswahl um Config-Metadaten erweitern (TF/Horizon/Feature-Set sichtbar).
+- [ ] Live/Paper-Environment strikt mit Manifest initialisieren (keine stillen Fallbacks).
+- [x] Colab-Workflow so anpassen, dass alle Parameter direkt im 99er Notebook übergeben werden können.

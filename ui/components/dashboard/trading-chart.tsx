@@ -35,6 +35,15 @@ interface TradingChartProps {
 const TIMEFRAMES = ["15m", "1h", "4h", "1d"] as const;
 type Timeframe = typeof TIMEFRAMES[number];
 
+const INITIAL_TIMEFRAME: Timeframe = "1h";
+
+type ManualXView = { window: number; rightOffset: number };
+type CachedChartView = { manualXView: ManualXView | null; yZoom: number };
+
+const chartViewCache = new Map<string, CachedChartView>();
+const chartViewCacheKey = (modelId: string, symbol: string, timeframe: Timeframe) =>
+  `${modelId}::${symbol}::${timeframe}`;
+
 const TF_TO_15M_FACTOR: Record<Timeframe, number> = {
   "15m": 1,
   "1h": 4,
@@ -120,23 +129,35 @@ function CandleStickShape(props: any) {
 }
 
 export function TradingChart({ modelId, symbol = "BTC/USDT" }: TradingChartProps) {
-  const [timeframe, setTimeframe] = useState<Timeframe>("1h");
+  const [timeframe, setTimeframe] = useState<Timeframe>(INITIAL_TIMEFRAME);
   const [candles, setCandles] = useState<Candle[]>([]);
   const [forecast, setForecast] = useState<number[][]>([]);
   const [livePrice, setLivePrice] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
 
   const [xRange, setXRange] = useState<{ startIndex: number; endIndex: number } | null>(null);
-  const [manualXView, setManualXView] = useState<{ window: number; rightOffset: number } | null>(null);
-  const [yZoom, setYZoom] = useState(1);
+  const [manualXView, setManualXView] = useState<ManualXView | null>(
+    () => chartViewCache.get(chartViewCacheKey(modelId, symbol, INITIAL_TIMEFRAME))?.manualXView ?? null
+  );
+  const [yZoom, setYZoom] = useState(
+    () => chartViewCache.get(chartViewCacheKey(modelId, symbol, INITIAL_TIMEFRAME))?.yZoom ?? 1
+  );
   const [isYDragging, setIsYDragging] = useState(false);
   const yDragRef = useRef<{ startY: number; startZoom: number } | null>(null);
   const chartViewportRef = useRef<HTMLDivElement | null>(null);
+  const brushInteractingRef = useRef(false);
+  const userZoomRef = useRef(false);
+  const manualXViewRef = useRef<ManualXView | null>(null);
   const pinchRef = useRef<{
     startDistance: number;
     startRange: { startIndex: number; endIndex: number };
     startCenterRatio: number;
   } | null>(null);
+
+  const currentViewCacheKey = useMemo(
+    () => chartViewCacheKey(modelId, symbol, timeframe),
+    [modelId, symbol, timeframe]
+  );
 
   useEffect(() => {
     const fetchData = async () => {
@@ -212,12 +233,49 @@ export function TradingChart({ modelId, symbol = "BTC/USDT" }: TradingChartProps
     return () => clearInterval(interval);
   }, [timeframe, modelId, symbol]);
 
-  // On timeframe switch: reset view to default range/zoom
+  // On timeframe switch: restore cached view (or default) and recompute range from current data.
   useEffect(() => {
+    const cached = chartViewCache.get(chartViewCacheKey(modelId, symbol, timeframe));
     setXRange(null);
-    setManualXView(null);
-    setYZoom(1);
-  }, [timeframe]);
+    setManualXView(cached?.manualXView ?? null);
+    setYZoom(cached?.yZoom ?? 1);
+    manualXViewRef.current = cached?.manualXView ?? null;
+    userZoomRef.current = Boolean(cached?.manualXView);
+  }, [modelId, symbol, timeframe]);
+
+  // Persist current view in-memory and localStorage so remounts / server refreshes don't snap zoom back.
+  useEffect(() => {
+    const view = { manualXView, yZoom };
+    chartViewCache.set(currentViewCacheKey, view);
+    try {
+      localStorage.setItem(`chartView::${currentViewCacheKey}`, JSON.stringify(view));
+    } catch {}
+  }, [currentViewCacheKey, manualXView, yZoom]);
+
+  // Initial load from cache/localStorage
+  useEffect(() => {
+    const cacheKey = chartViewCacheKey(modelId, symbol, timeframe);
+    let cached = chartViewCache.get(cacheKey);
+    if (!cached) {
+      try {
+        const stored = localStorage.getItem(`chartView::${cacheKey}`);
+        if (stored) cached = JSON.parse(stored);
+      } catch {}
+    }
+
+    if (cached) {
+      setManualXView(cached.manualXView);
+      setYZoom(cached.yZoom);
+      manualXViewRef.current = cached.manualXView;
+      userZoomRef.current = Boolean(cached.manualXView);
+    }
+  }, [modelId, symbol, timeframe]);
+
+  useEffect(() => {
+    if (manualXView) {
+      manualXViewRef.current = manualXView;
+    }
+  }, [manualXView]);
 
   const chartData = useMemo(() => {
     if (!candles.length) return [];
@@ -299,23 +357,35 @@ export function TradingChart({ modelId, symbol = "BTC/USDT" }: TradingChartProps
   useEffect(() => {
     if (!chartData.length) return;
 
+    // Use current or cached view
+    const stickyView = manualXView ?? manualXViewRef.current;
+    
+    // Only restore sticky view if user explicitly zoomed (userZoomRef) OR if we have a valid cache from localStorage/memory
+    if ((userZoomRef.current || stickyView) && stickyView && !manualXView) {
+      setManualXView(stickyView);
+    }
+
     setXRange((prev) => {
       const maxIndex = chartData.length - 1;
 
-      // If user manually set a viewport, keep it sticky across updates
-      if (manualXView) {
-        const window = clamp(manualXView.window, 2, maxIndex + 1);
-        const rightOffset = clamp(manualXView.rightOffset, 0, maxIndex);
+      // If user manually set a viewport (or loaded one), keep it sticky across updates
+      if (stickyView) {
+        const window = clamp(stickyView.window, 2, maxIndex + 1);
+        const rightOffset = clamp(stickyView.rightOffset, 0, maxIndex);
+        
+        // Pin the window to the right edge if rightOffset is 0 (live mode)
+        // Otherwise keep it at the same distance from the right
         const endIndex = clamp(maxIndex - rightOffset, 0, maxIndex);
         const startIndex = clamp(endIndex - window + 1, 0, endIndex);
+        
         return { startIndex, endIndex };
       }
 
-      if (!prev) return defaultXRange;
-
-      const startIndex = clamp(prev.startIndex, 0, maxIndex);
-      const endIndex = clamp(prev.endIndex, startIndex, maxIndex);
-      return { startIndex, endIndex };
+      // If no manual view, stick to default rolling window (live follow)
+      // BUT: If prev existed and we have no manual override, do we keep following?
+      // Yes, defaultXRange logic handles "live follow" by calculating from end.
+      
+      return defaultXRange;
     });
   }, [chartData, defaultXRange, manualXView]);
 
@@ -355,9 +425,48 @@ export function TradingChart({ modelId, symbol = "BTC/USDT" }: TradingChartProps
     }
     setManualXView(null);
     setYZoom(1);
-  }, [defaultXRange]);
+    manualXViewRef.current = null;
+    userZoomRef.current = false;
+    chartViewCache.set(currentViewCacheKey, { manualXView: null, yZoom: 1 });
+  }, [defaultXRange, currentViewCacheKey]);
+
+  const isBrushTarget = (target: EventTarget | null) => {
+    return target instanceof Element && Boolean(target.closest(".recharts-brush"));
+  };
+
+  const onViewportMouseDownCapture = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (isBrushTarget(e.target)) {
+      brushInteractingRef.current = true;
+    }
+  };
+
+  const onViewportTouchStartCapture = (e: React.TouchEvent<HTMLDivElement>) => {
+    if (isBrushTarget(e.target)) {
+      brushInteractingRef.current = true;
+    }
+  };
+
+  useEffect(() => {
+    const clearBrushInteraction = () => {
+      brushInteractingRef.current = false;
+    };
+
+    window.addEventListener("mouseup", clearBrushInteraction);
+    window.addEventListener("touchend", clearBrushInteraction);
+    window.addEventListener("touchcancel", clearBrushInteraction);
+
+    return () => {
+      window.removeEventListener("mouseup", clearBrushInteraction);
+      window.removeEventListener("touchend", clearBrushInteraction);
+      window.removeEventListener("touchcancel", clearBrushInteraction);
+    };
+  }, []);
 
   const onBrushChange = useCallback((range: { startIndex?: number; endIndex?: number }) => {
+    // Recharts Brush emits programmatic onChange callbacks during rerender/data refresh.
+    // Accept only user-driven brush drags to avoid snapping back on each refresh tick.
+    if (!brushInteractingRef.current) return;
+
     if (typeof range?.startIndex === "number" && typeof range?.endIndex === "number") {
       const next = { startIndex: range.startIndex, endIndex: range.endIndex };
       setXRange(next);
@@ -365,7 +474,10 @@ export function TradingChart({ modelId, symbol = "BTC/USDT" }: TradingChartProps
       const maxIndex = Math.max(0, chartData.length - 1);
       const window = Math.max(2, next.endIndex - next.startIndex + 1);
       const rightOffset = Math.max(0, maxIndex - next.endIndex);
-      setManualXView({ window, rightOffset });
+      const nextView = { window, rightOffset };
+      userZoomRef.current = true;
+      manualXViewRef.current = nextView;
+      setManualXView(nextView);
     }
   }, [chartData.length]);
 
@@ -390,22 +502,39 @@ export function TradingChart({ modelId, symbol = "BTC/USDT" }: TradingChartProps
     const endIndex = startIndex + newWindow - 1;
 
     setXRange({ startIndex, endIndex });
-    setManualXView({
+    const nextView = {
       window: Math.max(2, endIndex - startIndex + 1),
       rightOffset: Math.max(0, maxIndex - endIndex),
-    });
+    };
+    userZoomRef.current = true;
+    manualXViewRef.current = nextView;
+    setManualXView(nextView);
   }, [chartData, xRange, defaultXRange]);
 
-  const onChartWheel = (e: React.WheelEvent<HTMLDivElement>) => {
+  const onChartWheel = (clientX: number, clientY: number, deltaY: number, rect: DOMRect) => {
     if (!xRange && !defaultXRange) return;
 
-    e.preventDefault();
-
-    const rect = e.currentTarget.getBoundingClientRect();
-    const ratio = rect.width > 0 ? (e.clientX - rect.left) / rect.width : 0.5;
-    const scale = Math.exp(-e.deltaY * 0.0022);
+    const ratio = rect.width > 0 ? (clientX - rect.left) / rect.width : 0.5;
+    const scale = Math.exp(-deltaY * 0.0022);
     zoomXAroundCenter(ratio, scale);
   };
+
+  useEffect(() => {
+    const el = chartViewportRef.current;
+    if (!el) return;
+
+    const handleWheel = (e: WheelEvent) => {
+      // Block page scroll while zooming the chart.
+      e.preventDefault();
+      e.stopPropagation();
+
+      const rect = el.getBoundingClientRect();
+      onChartWheel(e.clientX, e.clientY, e.deltaY, rect);
+    };
+
+    el.addEventListener("wheel", handleWheel, { passive: false });
+    return () => el.removeEventListener("wheel", handleWheel);
+  }, [xRange, defaultXRange, zoomXAroundCenter]);
 
   const onChartTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
     if (e.touches.length !== 2) return;
@@ -533,6 +662,17 @@ export function TradingChart({ modelId, symbol = "BTC/USDT" }: TradingChartProps
     return null;
   }, [livePrice, candles]);
 
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    (window as any).__tradingChartDebug = {
+      timeframe,
+      xRange,
+      manualXView,
+      userZoom: userZoomRef.current,
+      chartLen: chartData.length,
+    };
+  }, [timeframe, xRange, manualXView, chartData.length]);
+
   const formatPrice = (value: number) => {
     if (!Number.isFinite(value)) return "-";
     return value.toLocaleString("en-US", {
@@ -597,8 +737,15 @@ export function TradingChart({ modelId, symbol = "BTC/USDT" }: TradingChartProps
 
         <div
           ref={chartViewportRef}
-          className="h-[320px] w-full relative"
-          onWheel={onChartWheel}
+          className="h-[320px] w-full relative overscroll-contain touch-none"
+          onMouseDownCapture={onViewportMouseDownCapture}
+          onTouchStartCapture={onViewportTouchStartCapture}
+          onMouseUpCapture={() => {
+            brushInteractingRef.current = false;
+          }}
+          onTouchEndCapture={() => {
+            brushInteractingRef.current = false;
+          }}
           onTouchStart={onChartTouchStart}
           onTouchMove={onChartTouchMove}
           onTouchEnd={onChartTouchEnd}
@@ -741,6 +888,7 @@ export function TradingChart({ modelId, symbol = "BTC/USDT" }: TradingChartProps
               {/* X-axis pan/zoom handles */}
               {xRange && (
                 <Brush
+                  key={`brush-${timeframe}`}
                   dataKey="time"
                   height={18}
                   stroke="#6366f1"

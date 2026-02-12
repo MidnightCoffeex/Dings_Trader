@@ -1,22 +1,21 @@
+"use client";
+
+import { AppShell } from "@/components/layout/app-shell";
 import { PageHeader } from "@/components/layout/page-header";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { Suspense } from "react";
 
-export default function DataPage() {
+function DataContent() {
   return (
     <div className="space-y-6">
-      <PageHeader
-        title="Data"
-        subtitle="Ingestion, feature stores, and dataset health."
-      />
+      <PageHeader title="Data" subtitle="Ingestion, feature stores, and dataset health." />
 
       <div className="grid gap-4 lg:grid-cols-3">
         <Card className="bg-card/40 lg:col-span-2">
           <CardHeader className="flex-row items-center justify-between">
-            <CardTitle className="text-sm font-medium text-muted-foreground">
-              Datasets
-            </CardTitle>
+            <CardTitle className="text-sm font-medium text-muted-foreground">Datasets</CardTitle>
             <Button size="sm" variant="secondary">Add source</Button>
           </CardHeader>
           <CardContent>
@@ -34,9 +33,7 @@ export default function DataPage() {
                     <div className="truncate text-sm font-medium">{d.name}</div>
                     <div className="text-xs text-muted-foreground">Rows: {d.rows}</div>
                   </div>
-                  <Badge variant={d.status === "Healthy" ? "success" : "warning"}>
-                    {d.status}
-                  </Badge>
+                  <Badge variant={d.status === "Healthy" ? "success" : "warning"}>{d.status}</Badge>
                 </div>
               ))}
             </div>
@@ -45,9 +42,7 @@ export default function DataPage() {
 
         <Card className="bg-card/40">
           <CardHeader>
-            <CardTitle className="text-sm font-medium text-muted-foreground">
-              Pipeline
-            </CardTitle>
+            <CardTitle className="text-sm font-medium text-muted-foreground">Pipeline</CardTitle>
           </CardHeader>
           <CardContent className="space-y-3">
             <div className="rounded-md border border-border/70 bg-background/30 p-3">
@@ -58,12 +53,20 @@ export default function DataPage() {
               <div className="text-xs text-muted-foreground">Feature refresh</div>
               <div className="text-sm font-medium">Every 5m</div>
             </div>
-            <Button className="w-full" variant="outline">
-              Run ingestion (stub)
-            </Button>
+            <Button className="w-full" variant="outline">Run ingestion (stub)</Button>
           </CardContent>
         </Card>
       </div>
     </div>
+  );
+}
+
+export default function DataPage() {
+  return (
+    <AppShell>
+      <Suspense fallback={<div>Loading data...</div>}>
+        <DataContent />
+      </Suspense>
+    </AppShell>
   );
 }

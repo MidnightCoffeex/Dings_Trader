@@ -9,3 +9,4 @@ export { PaperTradingPanel } from "./paper-trading-panel";
 export { LegacyTradeHistory } from "./legacy-trade-history";
 export { TradingSignalsTile } from "./trading-signals-tile";
 export { TradingChart } from "./trading-chart";
+export { TradingChartLightweight } from "./trading-chart-lightweight";

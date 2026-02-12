@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { AppShell } from "@/components/layout/app-shell";
 import { PageHeader } from "@/components/layout/page-header";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -80,8 +81,9 @@ export default function CapacityPage() {
   const memPct = useMemo(() => Number(data?.host?.memory?.usedPct ?? 0), [data]);
 
   return (
-    <div className="space-y-6">
-      <PageHeader title="Kapazität" subtitle="Live-Auslastung von Host + Trading-Services" />
+    <AppShell>
+      <div className="space-y-6">
+        <PageHeader title="Kapazität" subtitle="Live-Auslastung von Host + Trading-Services" />
 
       <div className="grid gap-4 md:grid-cols-3">
         <Card className="bg-card/40 border-primary/20">
@@ -163,7 +165,8 @@ export default function CapacityPage() {
             Last update: {data?.ts ? new Date(data.ts).toLocaleTimeString() : "-"}
           </div>
         </CardContent>
-      </Card>
-    </div>
+        </Card>
+      </div>
+    </AppShell>
   );
 }

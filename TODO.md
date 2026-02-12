@@ -50,6 +50,14 @@
 - [ ] Dynamische Positionsgrößen durch ML-Modell entscheiden lassen
 - [ ] Backtesting-Vergleich vs. Buy-and-Hold implementieren
 
+### 3. **Arg-first Schnittstellen-Refactor**
+- [ ] `notebooks/99_full_pipeline.ipynb` als Single Entry Point finalisieren
+- [ ] Parameterisierte PipelineConfig für TF/Horizon/Feature-Set/Lookback einführen
+- [ ] Modellpaar-Ordner + `manifest.json` standardisieren (Forecast+PPO+Scaler)
+- [ ] Backend/UI strikt auf Manifest-Metadaten verdrahten
+- [x] Alte Step-Notebooks gelöscht (2026-02-12, nur `99_full_pipeline.ipynb` bleibt)
+- [ ] Referenzplan: `docs/ARG_INTERFACE_REFACTOR_PLAN_2026-02-12.md`
+
 ## Dokumentation
 - [x] `docs/FUTURE_PLANS.md` erstellt (Dynamisches Scaling, ML-Sizing)
 - [x] `MEMORY.md` aktualisiert (Roadmap & Evolution)

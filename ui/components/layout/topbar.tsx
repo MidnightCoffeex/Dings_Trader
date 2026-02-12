@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, Suspense } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Bell, Menu, Plus, Search, RotateCcw } from "lucide-react";
@@ -17,7 +17,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 
-export function Topbar({
+function TopbarContent({
   onOpenMobileNav,
 }: {
   onOpenMobileNav?: () => void;
@@ -120,5 +120,13 @@ export function Topbar({
         </div>
       </div>
     </header>
+  );
+}
+
+export function Topbar(props: { onOpenMobileNav?: () => void }) {
+  return (
+    <Suspense fallback={<div className="h-16 w-full border-b border-border/70 bg-background/50" />}>
+      <TopbarContent {...props} />
+    </Suspense>
   );
 }

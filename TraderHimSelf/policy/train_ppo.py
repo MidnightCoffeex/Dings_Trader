@@ -22,13 +22,17 @@ Nutzung:
 import os
 import sys
 import argparse
+import json
+import re
+import shutil
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
-from typing import List, Optional, Dict, Any
+from typing import List, Optional
 
 # Add project root to path to allow imports
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -43,6 +47,8 @@ from feature_engine_train30 import FEATURE_COLUMNS_TRAIN30 as CORE_FEATURE_COLUM
 BASE_DATA_DIR = os.path.join(project_root, "data_processed")
 TRAIN30_DIR = os.path.join(BASE_DATA_DIR, "train30")  # separate training artifacts; live stays untouched
 MODELS_DIR = os.path.join(project_root, "models")
+PACKAGES_DIR = os.path.join(MODELS_DIR, "packages")
+PIPELINE_JSON_DEFAULT = os.path.join(MODELS_DIR, "pipeline_args.json")
 LOG_DIR = os.path.join(project_root, "runs/ppo_logs")
 CHECKPOINT_DIR = os.path.join(project_root, "checkpoints/ppo")
 
@@ -53,6 +59,192 @@ OS_OBS_DIM = CORE_DIM + FORECAST_DIM + ACCOUNT_DIM
 
 # --- FORECAST FEATURE COLUMNS ---
 FORECAST_COLUMNS = [f"forecast_{i}" for i in range(FORECAST_DIM)]
+
+
+def _slugify(s: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9._-]+", "_", str(s)).strip("_")
+
+
+def _normalize_tf(tf: str) -> str:
+    return str(tf).strip().lower()
+
+
+def _default_decision_file_for_tf(tf: str) -> str:
+    return os.path.join(BASE_DATA_DIR, f"aligned_{_normalize_tf(tf)}.parquet")
+
+
+def _default_features_file_for(feature_set: str, decision_tf: str) -> str:
+    base = os.path.join(BASE_DATA_DIR, str(feature_set))
+    tf_norm = _normalize_tf(decision_tf)
+    if tf_norm == "15m":
+        return os.path.join(base, "features.parquet")
+    return os.path.join(base, f"features_{tf_norm}.parquet")
+
+
+def _load_pipeline_json(path: Optional[str]) -> dict:
+    if not path:
+        return {}
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"WARN: failed to read pipeline json {path}: {e}")
+        return {}
+
+
+def _write_json(path: str, payload: dict):
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
+def _resolve_runtime_config(args) -> dict:
+    existing = _load_pipeline_json(args.pipeline_json)
+    existing_keys = set(existing.keys())
+
+    cfg = {
+        "pipeline_version": "arg_interface_v1",
+        "pipeline_json": args.pipeline_json or PIPELINE_JSON_DEFAULT,
+        "symbol": "BTCUSDT",
+        "decision_tf": "15m",
+        "intrabar_tf": "3m",
+        "feature_set": "train30",
+        "data_file_raw_decision": os.path.join(BASE_DATA_DIR, "aligned_15m.parquet"),
+        "data_file_raw_intrabar": os.path.join(BASE_DATA_DIR, "aligned_3m.parquet"),
+        "data_file_features": os.path.join(TRAIN30_DIR, "features.parquet"),
+        "forecast_features_output": os.path.join(TRAIN30_DIR, "forecast_features.parquet"),
+        "package_root": PACKAGES_DIR,
+        "package_id": None,
+        "package_dir": None,
+        "manifest_path": None,
+        "ppo_model_alias_path": os.path.join(MODELS_DIR, "ppo_policy_final.zip"),
+        "ppo_model_base": None,
+        "ppo_model_path": None,
+        # PPO hyperparams
+        "ppo_total_timesteps": 1_000_000,
+        "ppo_learning_rate": 3e-4,
+        "ppo_n_steps": 2048,
+        "ppo_batch_size": 64,
+        "ppo_n_epochs": 10,
+        "ppo_gamma": 0.99,
+        "ppo_gae_lambda": 0.95,
+        "ppo_clip_range": 0.2,
+        "ppo_ent_coef": 0.01,
+        "ppo_n_envs": 1,
+        "ppo_vec_env": "auto",
+        "ppo_device": "auto",
+    }
+
+    # Keep any forecast-stage metadata present.
+    cfg.update(existing)
+
+    # --- CLI overrides (metadata + paths) ---
+    if getattr(args, "symbol", None) is not None:
+        cfg["symbol"] = args.symbol
+
+    decision_tf_cli = args.decision_tf if getattr(args, "decision_tf", None) is not None else getattr(args, "candles", None)
+    if decision_tf_cli is not None:
+        cfg["decision_tf"] = _normalize_tf(decision_tf_cli)
+
+    if getattr(args, "intrabar_tf", None) is not None:
+        cfg["intrabar_tf"] = _normalize_tf(args.intrabar_tf)
+
+    if getattr(args, "decision_candles_file", None) is not None:
+        cfg["data_file_raw_decision"] = args.decision_candles_file
+    elif ("data_file_raw_decision" not in existing_keys):
+        # TF-based default file binding (e.g. aligned_15m.parquet, aligned_1h.parquet)
+        cfg["data_file_raw_decision"] = _default_decision_file_for_tf(cfg["decision_tf"])
+
+    if getattr(args, "intrabar_candles_file", None) is not None:
+        cfg["data_file_raw_intrabar"] = args.intrabar_candles_file
+
+    if getattr(args, "features_file", None) is not None:
+        cfg["data_file_features"] = args.features_file
+    elif ("data_file_features" not in existing_keys):
+        cfg["data_file_features"] = _default_features_file_for(
+            cfg.get("feature_set", "train30"), cfg["decision_tf"]
+        )
+
+    if getattr(args, "forecast_features_file", None) is not None:
+        cfg["forecast_features_output"] = args.forecast_features_file
+
+    if getattr(args, "package_root", None) is not None:
+        cfg["package_root"] = args.package_root
+    if getattr(args, "package_id", None) is not None:
+        cfg["package_id"] = args.package_id
+
+    # Apply profile defaults only if not explicitly set via JSON and not overridden via CLI.
+    if args.profile == "high-util":
+        if ("ppo_n_steps" not in existing_keys) and (args.n_steps is None):
+            cfg["ppo_n_steps"] = 8192
+        if ("ppo_batch_size" not in existing_keys) and (args.batch_size is None):
+            cfg["ppo_batch_size"] = 512
+
+    # --- CLI overrides (PPO hyperparams) ---
+    if getattr(args, "total_timesteps", None) is not None:
+        cfg["ppo_total_timesteps"] = int(args.total_timesteps)
+    if getattr(args, "learning_rate", None) is not None:
+        cfg["ppo_learning_rate"] = float(args.learning_rate)
+    if getattr(args, "n_steps", None) is not None:
+        cfg["ppo_n_steps"] = int(args.n_steps)
+    if getattr(args, "batch_size", None) is not None:
+        cfg["ppo_batch_size"] = int(args.batch_size)
+    if getattr(args, "n_epochs", None) is not None:
+        cfg["ppo_n_epochs"] = int(args.n_epochs)
+    if getattr(args, "gamma", None) is not None:
+        cfg["ppo_gamma"] = float(args.gamma)
+    if getattr(args, "gae_lambda", None) is not None:
+        cfg["ppo_gae_lambda"] = float(args.gae_lambda)
+    if getattr(args, "clip_range", None) is not None:
+        cfg["ppo_clip_range"] = float(args.clip_range)
+    if getattr(args, "ent_coef", None) is not None:
+        cfg["ppo_ent_coef"] = float(args.ent_coef)
+
+    if getattr(args, "n_envs", None) is not None:
+        cfg["ppo_n_envs"] = int(args.n_envs)
+    if getattr(args, "vec_env", None) is not None:
+        cfg["ppo_vec_env"] = str(args.vec_env)
+    if getattr(args, "device", None) is not None:
+        cfg["ppo_device"] = str(args.device)
+
+    cfg["decision_tf"] = _normalize_tf(cfg.get("decision_tf", "15m"))
+    cfg["intrabar_tf"] = _normalize_tf(cfg.get("intrabar_tf", "3m"))
+
+    # Package inference: prefer package_id from forecast stage, else create.
+    if not cfg.get("package_id"):
+        horizon = cfg.get("forecast_horizon_steps") or cfg.get("forecast_horizon") or "?"
+        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        cfg["package_id"] = _slugify(
+            f"{cfg.get('decision_tf','15m')}_h{horizon}_{cfg.get('feature_set','train30')}_ppo_{ts}"
+        )
+
+    if not cfg.get("package_dir"):
+        cfg["package_dir"] = os.path.join(cfg.get("package_root", PACKAGES_DIR), cfg["package_id"])
+
+    if not cfg.get("manifest_path"):
+        cfg["manifest_path"] = os.path.join(cfg["package_dir"], "manifest.json")
+
+    if not cfg.get("ppo_model_base"):
+        cfg["ppo_model_base"] = os.path.join(cfg["package_dir"], "ppo_policy_final")
+
+    if not cfg.get("ppo_model_path"):
+        cfg["ppo_model_path"] = cfg["ppo_model_base"] + ".zip"
+
+    cfg["updated_at"] = datetime.utcnow().isoformat() + "Z"
+    return cfg
+
+
+def _persist_pipeline_config(cfg: dict):
+    pipeline_json = cfg.get("pipeline_json") or PIPELINE_JSON_DEFAULT
+    _write_json(pipeline_json, cfg)
+    manifest_path = cfg.get("manifest_path")
+    if manifest_path:
+        _write_json(manifest_path, cfg)
+
 
 class TrainingPerpEnv(PerpEnv):
     """
@@ -177,12 +369,13 @@ def _slot15m_to_ms(series: pd.Series) -> pd.Series:
     return pd.Series(ms.astype("int64"), index=s.index, name=s.name)
 
 
-def load_data(*, allow_dummy_forecast: bool = False):
+def load_data(*, allow_dummy_forecast: bool = False, runtime_cfg: Optional[dict] = None):
     """Lädt und mergt alle benötigten Daten."""
+    cfg = runtime_cfg or {}
     print("Lade Daten...")
-    
-    # 1. Candles 15m
-    p_15m = os.path.join(BASE_DATA_DIR, "aligned_15m.parquet")
+
+    # 1. Candles (decision tf, currently expected 15m semantics)
+    p_15m = cfg.get("data_file_raw_decision") or os.path.join(BASE_DATA_DIR, "aligned_15m.parquet")
     if not os.path.exists(p_15m):
         raise FileNotFoundError(f"{p_15m} nicht gefunden. Bitte erst build_dataset.py ausführen.")
     df_15m = pd.read_parquet(p_15m)
@@ -193,23 +386,25 @@ def load_data(*, allow_dummy_forecast: bool = False):
         df_15m["open_time_ms"] = (idx_ns.view("int64") // 10**6).astype("int64")
 
     
-    # 2. Candles 3m
-    p_3m = os.path.join(BASE_DATA_DIR, "aligned_3m.parquet")
+    # 2. Candles (intrabar tf, currently expected 3m semantics + slot_15m column)
+    p_3m = cfg.get("data_file_raw_intrabar") or os.path.join(BASE_DATA_DIR, "aligned_3m.parquet")
     if not os.path.exists(p_3m):
         raise FileNotFoundError(f"{p_3m} nicht gefunden.")
     df_3m = pd.read_parquet(p_3m)
-    
+
     # 3. Core Features
-    p_feat = os.path.join(TRAIN30_DIR, "features.parquet")
+    p_feat = cfg.get("data_file_features") or os.path.join(TRAIN30_DIR, "features.parquet")
     if not os.path.exists(p_feat):
-        raise FileNotFoundError(f"{p_feat} nicht gefunden. Bitte feature_engine_train30.py build ausführen (train30 artifacts).")
+        raise FileNotFoundError(
+            f"{p_feat} nicht gefunden. Bitte feature_engine_train30.py build ausführen (train30 artifacts)."
+        )
     df_feat = pd.read_parquet(p_feat)
     missing_core = [c for c in CORE_FEATURE_COLUMNS if c not in df_feat.columns]
     if missing_core:
         raise ValueError(f"features.parquet missing core columns: {missing_core}")
     
-    # 4. Forecast Features
-    p_forecast = os.path.join(TRAIN30_DIR, "forecast_features.parquet")
+    # 4. Forecast Features (default: uses output path from pipeline JSON)
+    p_forecast = cfg.get("forecast_features_output") or os.path.join(TRAIN30_DIR, "forecast_features.parquet")
     if not os.path.exists(p_forecast):
         if allow_dummy_forecast:
             print(f"WARNUNG: {p_forecast} nicht gefunden. Dummy-Forecast-Features werden erstellt.")
@@ -332,62 +527,138 @@ def build_vec_env(df_15m, df_3m, *, n_envs: int, vec_env: str):
 
     raise ValueError(f"Unknown vec env mode: {vec_env}")
 
-def get_config(args) -> Dict[str, Any]:
-    config = {
-        'total_timesteps': 1_000_000,
-        'learning_rate': 3e-4,
-        'n_steps': 2048,
-        'batch_size': 64,
-        'n_epochs': 10,
-        'gamma': 0.99,
-        'gae_lambda': 0.95,
-        'clip_range': 0.2,
-        'ent_coef': 0.01
-    }
-    
-    if args.profile == 'high-util':
-        config.update({
-            'n_steps': 8192,
-            'batch_size': 512,
-        })
-    
-    # Explicit overrides
-    if args.n_steps is not None: config['n_steps'] = args.n_steps
-    if args.batch_size is not None: config['batch_size'] = args.batch_size
-    
-    return config
+# legacy get_config removed; runtime config is resolved via _resolve_runtime_config().
 
 def main():
     os.makedirs(MODELS_DIR, exist_ok=True)
+    os.makedirs(PACKAGES_DIR, exist_ok=True)
     os.makedirs(LOG_DIR, exist_ok=True)
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     os.makedirs(TRAIN30_DIR, exist_ok=True)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--allow-dummy-forecast", action="store_true", help="Use zero forecast features if missing.")
+    parser.add_argument(
+        "--pipeline-json",
+        type=str,
+        default=PIPELINE_JSON_DEFAULT,
+        help="Shared pipeline config/manifest JSON (from PatchTST stage).",
+    )
+    parser.add_argument(
+        "--allow-dummy-forecast", action="store_true", help="Use zero forecast features if missing."
+    )
     parser.add_argument("--profile", choices=['default', 'high-util'], default='default')
-    parser.add_argument("--n-steps", type=int, help="PPO n_steps")
-    parser.add_argument("--batch-size", type=int, help="PPO batch_size")
-    parser.add_argument("--n-envs", type=int, default=1, help="Number of parallel environments")
-    parser.add_argument("--vec-env", choices=["auto", "dummy", "subproc"], default="auto", help="Vectorized env backend")
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="Training device")
+
+    # Metadata + data paths (prefer JSON; CLI overrides win)
+    parser.add_argument("--symbol", type=str, default=None)
+    parser.add_argument("--decision-tf", type=str, default=None)
+    parser.add_argument("--candles", type=str, default=None, help="Alias for --decision-tf")
+    parser.add_argument("--intrabar-tf", type=str, default=None)
+
+    parser.add_argument(
+        "--decision-candles-file",
+        type=str,
+        default=None,
+        help="Decision candle parquet (expected aligned_15m.parquet schema)",
+    )
+    parser.add_argument(
+        "--intrabar-candles-file",
+        type=str,
+        default=None,
+        help="Intrabar candle parquet (expected aligned_3m.parquet schema incl. slot_15m)",
+    )
+    parser.add_argument(
+        "--features-file",
+        type=str,
+        default=None,
+        help="Core features parquet (train30/features.parquet)",
+    )
+    parser.add_argument(
+        "--forecast-features-file",
+        type=str,
+        default=None,
+        help="Forecast features parquet (train30/forecast_features.parquet or package-local)",
+    )
+
+    parser.add_argument("--package-root", type=str, default=None, help="Root folder for packaged outputs")
+    parser.add_argument(
+        "--package-id",
+        type=str,
+        default=None,
+        help="Explicit package id (else reuse from pipeline JSON or auto-generate)",
+    )
+
+    # PPO hyperparams (prefer JSON; CLI overrides win)
+    parser.add_argument(
+        "--total-timesteps",
+        type=int,
+        default=None,
+        help="Total timesteps (e.g. 2000000 or 8000000)",
+    )
+    parser.add_argument("--learning-rate", type=float, default=None, help="Learning rate")
+    parser.add_argument("--n-steps", type=int, default=None, help="PPO n_steps")
+    parser.add_argument("--batch-size", type=int, default=None, help="PPO batch_size")
+    parser.add_argument("--n-epochs", type=int, default=None, help="PPO n_epochs")
+    parser.add_argument("--gamma", type=float, default=None, help="Discount gamma")
+    parser.add_argument("--gae-lambda", type=float, default=None, help="GAE lambda")
+    parser.add_argument("--clip-range", type=float, default=None, help="Clip range")
+    parser.add_argument("--ent-coef", type=float, default=None, help="Entropy coefficient")
+
+    # Runtime
+    parser.add_argument("--n-envs", type=int, default=None, help="Number of parallel environments")
+    parser.add_argument(
+        "--vec-env",
+        choices=["auto", "dummy", "subproc"],
+        default=None,
+        help="Vectorized env backend",
+    )
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default=None, help="Training device")
     args = parser.parse_args()
-    
-    cfg = get_config(args)
-    print(f"Configuration: {cfg}")
+
+    runtime_cfg = _resolve_runtime_config(args)
+
+    ppo_cfg = {
+        'total_timesteps': int(runtime_cfg['ppo_total_timesteps']),
+        'learning_rate': float(runtime_cfg['ppo_learning_rate']),
+        'n_steps': int(runtime_cfg['ppo_n_steps']),
+        'batch_size': int(runtime_cfg['ppo_batch_size']),
+        'n_epochs': int(runtime_cfg['ppo_n_epochs']),
+        'gamma': float(runtime_cfg['ppo_gamma']),
+        'gae_lambda': float(runtime_cfg['ppo_gae_lambda']),
+        'clip_range': float(runtime_cfg['ppo_clip_range']),
+        'ent_coef': float(runtime_cfg['ppo_ent_coef']),
+    }
+
+    print(f"Pipeline JSON: {runtime_cfg.get('pipeline_json')}")
+    print(
+        f"Data: decision={runtime_cfg.get('data_file_raw_decision')} intrabar={runtime_cfg.get('data_file_raw_intrabar')}"
+    )
+    print(
+        f"Features: core={runtime_cfg.get('data_file_features')} forecast={runtime_cfg.get('forecast_features_output')}"
+    )
+    print(f"PPO Configuration: {ppo_cfg}")
+
+    if runtime_cfg.get('decision_tf') != '15m' or runtime_cfg.get('intrabar_tf') != '3m':
+        print(
+            "WARN: PerpEnv is currently hard-wired for 15m decision + 3m intrabar (slot_15m). "
+            "Other TFs are metadata-only for now."
+        )
     
     try:
-        df_15m, df_3m = load_data(allow_dummy_forecast=args.allow_dummy_forecast)
+        df_15m, df_3m = load_data(allow_dummy_forecast=args.allow_dummy_forecast, runtime_cfg=runtime_cfg)
     except (FileNotFoundError, ValueError) as e:
         print(f"Fehler beim Laden der Daten: {e}")
         return
 
-    env, env_mode = build_vec_env(df_15m, df_3m, n_envs=max(1, int(args.n_envs)), vec_env=args.vec_env)
-    print(f"VecEnv mode: {env_mode} | n_envs={max(1, int(args.n_envs))}")
+    n_envs = max(1, int(runtime_cfg.get("ppo_n_envs", 1)))
+    vec_env = str(runtime_cfg.get("ppo_vec_env", "auto"))
+    device_pref = str(runtime_cfg.get("ppo_device", "auto"))
 
-    if args.device == "cpu":
+    env, env_mode = build_vec_env(df_15m, df_3m, n_envs=n_envs, vec_env=vec_env)
+    print(f"VecEnv mode: {env_mode} | n_envs={n_envs}")
+
+    if device_pref == "cpu":
         model_device = "cpu"
-    elif args.device == "cuda":
+    elif device_pref == "cuda":
         if not torch.cuda.is_available():
             raise RuntimeError("--device cuda requested but CUDA is not available")
         model_device = "cuda"
@@ -403,14 +674,14 @@ def main():
     model = PPO(
         "MlpPolicy",
         env,
-        learning_rate=cfg['learning_rate'],
-        n_steps=cfg['n_steps'],
-        batch_size=cfg['batch_size'],
-        n_epochs=cfg['n_epochs'],
-        gamma=cfg['gamma'],
-        gae_lambda=cfg['gae_lambda'],
-        clip_range=cfg['clip_range'],
-        ent_coef=cfg['ent_coef'],
+        learning_rate=ppo_cfg['learning_rate'],
+        n_steps=ppo_cfg['n_steps'],
+        batch_size=ppo_cfg['batch_size'],
+        n_epochs=ppo_cfg['n_epochs'],
+        gamma=ppo_cfg['gamma'],
+        gae_lambda=ppo_cfg['gae_lambda'],
+        clip_range=ppo_cfg['clip_range'],
+        ent_coef=ppo_cfg['ent_coef'],
         verbose=1,
         tensorboard_log=LOG_DIR,
         policy_kwargs=policy_kwargs,
@@ -423,16 +694,37 @@ def main():
         name_prefix="ppo_model"
     )
     
-    print(f"Starte Training für {cfg['total_timesteps']} Timesteps...")
+    runtime_cfg["ppo_train_started_at"] = datetime.utcnow().isoformat() + "Z"
+    runtime_cfg["ppo_device"] = model_device
+    runtime_cfg["ppo_vec_env"] = env_mode
+    runtime_cfg["ppo_n_envs"] = n_envs
+    _persist_pipeline_config(runtime_cfg)
+
+    print(f"Starte Training für {ppo_cfg['total_timesteps']} Timesteps...")
     try:
-        model.learn(total_timesteps=cfg['total_timesteps'], callback=checkpoint_callback, progress_bar=True)
+        model.learn(total_timesteps=ppo_cfg['total_timesteps'], callback=checkpoint_callback, progress_bar=True)
         print("Training abgeschlossen.")
     except KeyboardInterrupt:
         print("Training unterbrochen. Speichere Zwischenstand...")
     
-    save_path = os.path.join(MODELS_DIR, "ppo_policy_final")
-    model.save(save_path)
-    print(f"Modell gespeichert unter: {save_path}.zip")
+    save_base = runtime_cfg.get("ppo_model_base") or os.path.join(MODELS_DIR, "ppo_policy_final")
+    os.makedirs(os.path.dirname(save_base), exist_ok=True)
+    model.save(save_base)
+    saved_zip = save_base + ".zip"
+
+    runtime_cfg["ppo_model_base"] = save_base
+    runtime_cfg["ppo_model_path"] = saved_zip
+    runtime_cfg["ppo_train_completed_at"] = datetime.utcnow().isoformat() + "Z"
+
+    alias_path = runtime_cfg.get("ppo_model_alias_path")
+    if alias_path and os.path.abspath(alias_path) != os.path.abspath(saved_zip):
+        os.makedirs(os.path.dirname(alias_path), exist_ok=True)
+        shutil.copy2(saved_zip, alias_path)
+        print(f"Alias aktualisiert: {alias_path}")
+
+    _persist_pipeline_config(runtime_cfg)
+
+    print(f"Modell gespeichert unter: {saved_zip}")
 
 
 if __name__ == "__main__":
