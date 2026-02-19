@@ -36,13 +36,14 @@ logger = logging.getLogger("Forecast-PatchTST")
 DEFAULT_LOOKBACK = 512
 DEFAULT_FORECAST_HORIZON = 192  # Max horizon (48h * 4 steps/h)
 INPUT_CHANNELS = len(FEATURE_COLUMNS)
-QUANTILES = [0.1, 0.5, 0.9]
+DEFAULT_QUANTILES = [0.2, 0.5, 0.8]  # v4 default: slightly tighter central interval than 0.1/0.9
 DEFAULT_HORIZON_STEPS = [4, 16, 48, 96, 192]  # 1h, 4h, 12h, 24h, 48h
 DEFAULT_HORIZON_WEIGHTS = [1.0, 1.0, 0.8, 0.6, 0.4]
 
 # Runtime-mutable globals (set in apply_runtime_config)
 LOOKBACK = DEFAULT_LOOKBACK
 FORECAST_HORIZON = DEFAULT_FORECAST_HORIZON
+QUANTILES = DEFAULT_QUANTILES.copy()
 HORIZON_STEPS = DEFAULT_HORIZON_STEPS.copy()
 HORIZON_WEIGHTS = {s: w for s, w in zip(DEFAULT_HORIZON_STEPS, DEFAULT_HORIZON_WEIGHTS)}
 
@@ -162,6 +163,7 @@ def _resolve_runtime_config(args) -> dict:
         "feature_set": "train30",
         "lookback_steps": DEFAULT_LOOKBACK,
         "forecast_horizon_steps": DEFAULT_FORECAST_HORIZON,
+        "forecast_quantiles": DEFAULT_QUANTILES.copy(),
         "horizon_steps": DEFAULT_HORIZON_STEPS.copy(),
         "horizon_weights": DEFAULT_HORIZON_WEIGHTS.copy(),
         "patch_epochs": DEFAULT_EPOCHS,
@@ -270,6 +272,7 @@ def _resolve_runtime_config(args) -> dict:
     # Horizon schedule overrides.
     custom_steps = _parse_csv_ints(args.horizon_steps)
     custom_weights = _parse_csv_floats(args.horizon_weights)
+    custom_quantiles = _parse_csv_floats(getattr(args, "quantiles", None))
 
     if custom_steps is not None:
         cfg["horizon_steps"] = custom_steps
@@ -286,7 +289,12 @@ def _resolve_runtime_config(args) -> dict:
             # Smooth fallback: earlier horizons weigh higher.
             cfg["horizon_weights"] = np.linspace(1.0, 0.5, n).round(4).tolist()
 
-    # Normalize / validate steps + weights
+    if custom_quantiles is not None:
+        cfg["forecast_quantiles"] = custom_quantiles
+    elif "forecast_quantiles" not in existing:
+        cfg["forecast_quantiles"] = DEFAULT_QUANTILES.copy()
+
+    # Normalize / validate steps + weights + quantiles
     horizon = int(cfg["forecast_horizon_steps"])
     steps = [int(s) for s in cfg["horizon_steps"] if int(s) > 0]
     steps = sorted(set(min(horizon, s) for s in steps))
@@ -297,8 +305,18 @@ def _resolve_runtime_config(args) -> dict:
         raise ValueError(
             f"horizon_weights length ({len(weights)}) must match horizon_steps length ({len(steps)})."
         )
+
+    quantiles = [float(q) for q in cfg.get("forecast_quantiles", DEFAULT_QUANTILES)]
+    if len(quantiles) != 3:
+        raise ValueError(f"forecast_quantiles must contain exactly 3 values, got {quantiles}")
+    if any((q <= 0.0 or q >= 1.0) for q in quantiles):
+        raise ValueError(f"forecast_quantiles must be in (0,1), got {quantiles}")
+    if any(quantiles[i] >= quantiles[i + 1] for i in range(len(quantiles) - 1)):
+        raise ValueError(f"forecast_quantiles must be strictly increasing, got {quantiles}")
+
     cfg["horizon_steps"] = steps
     cfg["horizon_weights"] = weights
+    cfg["forecast_quantiles"] = quantiles
 
     cfg["decision_tf"] = _normalize_tf(cfg.get("decision_tf", "15m"))
     cfg["intrabar_tf"] = _normalize_tf(cfg.get("intrabar_tf", "3m"))
@@ -364,9 +382,10 @@ def _persist_pipeline_config(cfg: dict):
 
 
 def _apply_runtime_config(cfg: dict):
-    global LOOKBACK, FORECAST_HORIZON, HORIZON_STEPS, HORIZON_WEIGHTS
+    global LOOKBACK, FORECAST_HORIZON, QUANTILES, HORIZON_STEPS, HORIZON_WEIGHTS
     LOOKBACK = int(cfg.get("lookback_steps", DEFAULT_LOOKBACK))
     FORECAST_HORIZON = int(cfg.get("forecast_horizon_steps", DEFAULT_FORECAST_HORIZON))
+    QUANTILES = [float(q) for q in cfg.get("forecast_quantiles", DEFAULT_QUANTILES)]
     HORIZON_STEPS = [int(s) for s in cfg.get("horizon_steps", DEFAULT_HORIZON_STEPS)]
     HORIZON_WEIGHTS = {
         int(s): float(w)
@@ -512,9 +531,10 @@ class PatchTST(nn.Module):
 
 # --- 3. Loss: Quantile / Pinball ---
 
-def quantile_loss(preds, target, quantiles=QUANTILES, weights=None, horizon_indices=None):
+def quantile_loss(preds, target, quantiles=None, weights=None, horizon_indices=None):
     loss = 0
-    
+    quantiles = QUANTILES if quantiles is None else quantiles
+
     # If we focus on specific horizons
     if horizon_indices is not None:
         preds = preds[:, horizon_indices, :]
@@ -555,25 +575,26 @@ def compute_forecast_features(forecast_seq, horizon: Optional[int] = None):
         raise ValueError(f"forecast horizon must be > 1, got {h}")
 
     # Use exactly h rows (truncate if caller passed larger array by accident).
+    # Columns correspond to low / median / high quantile heads configured by QUANTILES.
     arr = arr[:h, :3]
-    q10 = arr[:, 0]
-    q50 = arr[:, 1]
-    q90 = arr[:, 2]
+    q_low = arr[:, 0]
+    q_mid = arr[:, 1]
+    q_high = arr[:, 2]
 
     # 1) Horizon Block (15): ~2%, 8%, 25%, 50%, 100%
     horizon_fracs = [0.0208, 0.0833, 0.25, 0.5, 1.0]
     horizon_indices = [min(h - 1, max(0, int(round((h - 1) * f)))) for f in horizon_fracs]
     horizon_feats = []
     for idx in horizon_indices:
-        horizon_feats.extend([q10[idx], q50[idx], q90[idx]])
+        horizon_feats.extend([q_low[idx], q_mid[idx], q_high[idx]])
 
-    # 2) Path Block (12): q50 path sampled evenly from ~8%..100%
+    # 2) Path Block (12): median path sampled evenly from ~8%..100%
     start_idx = min(h - 1, max(0, int(round((h - 1) * 0.0833))))
     path_indices = np.linspace(start_idx, h - 1, 12).round().astype(int)
-    path_feats = q50[path_indices].tolist()
+    path_feats = q_mid[path_indices].tolist()
 
-    # 3) Curve Stats (8) on q50
-    curve = np.concatenate(([0.0], q50.astype(np.float32)))  # include "now" baseline
+    # 3) Curve Stats (8) on median path
+    curve = np.concatenate(([0.0], q_mid.astype(np.float32)))  # include "now" baseline
     min_ret = float(np.min(curve))
     max_ret = float(np.max(curve))
 
@@ -783,12 +804,13 @@ def train_model(args, runtime_cfg: dict):
     loader_cfg = get_config(args, runtime_cfg)
     logger.info(f"DataLoader/Runtime profile: {loader_cfg}")
     logger.info(
-        "PatchTST config => tf=%s horizon=%s lookback=%s epochs=%s lr=%s",
+        "PatchTST config => tf=%s horizon=%s lookback=%s epochs=%s lr=%s quantiles=%s",
         runtime_cfg.get("decision_tf"),
         runtime_cfg.get("forecast_horizon_steps"),
         runtime_cfg.get("lookback_steps"),
         runtime_cfg.get("patch_epochs"),
         runtime_cfg.get("patch_learning_rate"),
+        runtime_cfg.get("forecast_quantiles", DEFAULT_QUANTILES),
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1117,6 +1139,7 @@ if __name__ == "__main__":
     parser.add_argument('--forecast-horizon-steps', type=int, default=None, help='PatchTST forecast horizon steps')
     parser.add_argument('--horizon-steps', type=str, default=None, help='Comma-separated weighted horizon anchors (step units, e.g. "4,16,48,96,192")')
     parser.add_argument('--horizon-weights', type=str, default=None, help='Comma-separated horizon weights (same length as --horizon-steps)')
+    parser.add_argument('--quantiles', type=str, default=None, help='Comma-separated forecast quantiles (exactly 3, e.g. "0.2,0.5,0.8")')
 
     parser.add_argument('--epochs', type=int, default=None, help='PatchTST epochs')
     parser.add_argument('--learning-rate', type=float, default=None, help='PatchTST learning rate')
